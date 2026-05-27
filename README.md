@@ -7,6 +7,8 @@
 
 Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization.
 
+> **Note:** This crate is not a wrapper around Linux `mseal(2)`. "memseal" refers to sealing secrets in an encrypted in-memory vault.
+
 > **Disclaimer**: This library has **not been independently audited**. While it uses well-established cryptographic primitives (XChaCha20-Poly1305, Argon2i, HKDF-SHA256 via [orion](https://crates.io/crates/orion)), the integration has not been reviewed by a third-party security firm. Use at your own risk in production environments. If you find a vulnerability, please see [SECURITY.md](SECURITY.md) for responsible disclosure.
 
 ## Quick Start
@@ -69,7 +71,7 @@ vault.change_password(b"old-pass", b"new-pass")?;
 | Threat | Mitigation |
 |--------|------------|
 | **Memory disclosure via swap** | Ciphertext is `mlock`'d to prevent the OS from paging it to disk. |
-| **Cold boot / memory dump** | Data is encrypted at rest in memory with XChaCha20-Poly1305. Plaintext exists only briefly inside `access()` callbacks and is zeroized immediately after. |
+| **Cold boot / memory dump** | Data is encrypted at rest in memory with XChaCha20-Poly1305. Internal plaintext is zeroized after use. Note: `retrieve()` returns plaintext as `Vec<u8>` — callers are responsible for zeroizing the returned data. |
 | **Key reuse across operations** | Master key is never used directly. Two distinct subkeys (encryption, HMAC) are derived via HKDF-SHA256 with domain-separated info labels and the KDF salt. |
 | **Nonce reuse** | Nonces are derived deterministically from a monotonic counter via HKDF, not generated randomly. Counter overflow is checked. Index nonce rotated on every export. |
 | **KDF parameter downgrade** | The `VaultHeader` (containing Argon2i params) is passed as AAD to AEAD encryption. Tampering with iterations or memory cost causes authenticated decryption to fail. Header validated against bounds before KDF runs. |
@@ -128,13 +130,14 @@ vault.change_password(b"old-pass", b"new-pass")?;
 
 ## Security Properties
 
-- **`#![deny(unsafe_code)]`** at crate level. Only `secure_memory_vault.rs` allows unsafe for `mlock`/`munlock`.
+- **`#![deny(unsafe_code)]`** at crate level. Only `secure_memory_vault.rs` allows unsafe for `mlock`/`munlock` syscalls and `unsafe impl Send/Sync` (the struct uses a `Mutex` for interior synchronization and raw pointer fields are only accessed in `Drop`).
 - **Domain separation** for all key derivation: `MEMSEAL_SUBKEY_ENC_v1`, `MEMSEAL_SUBKEY_HMAC_v1`, `MEMSEAL_NONCE_CTR_v1`, `MEMSEAL_DATA_NONCE_v1`, `MEMSEAL_NAME_NONCE_v1`.
-- **Minimal key exposure.** Facade-level crypto operations execute inside `SecureMemoryVault::access()` callbacks. Note: the internal encryption key and nonce of each `SecureMemoryVault` instance reside on the heap without `mlock` (only the ciphertext buffer is locked).
+- **Partial swap protection.** Only the ciphertext buffer inside each `SecureMemoryVault` is `mlock`'d. The internal encryption key and nonce reside on the heap without `mlock` — if swapped to disk, they could be recovered. This is a known trade-off.
+- **Caller-owned plaintext.** `retrieve()` returns `Vec<u8>`. Internal temporaries are zeroized, but the returned plaintext is the caller's responsibility to zeroize or limit in scope.
 - **Authenticated encryption everywhere.** No unauthenticated ciphertext path exists. Per-entry AAD prevents entry-swap attacks.
 - **Version validation** on deserialization of `VaultIndex` and `VaultHeader`.
 - **Bounded input processing.** Header length, KDF parameters, file size (256 MiB), entry name (255B), and entry data (64 MiB) are all validated before use.
-- **Zeroization on all paths.** Key material, plaintext, and entry names are zeroized even on error returns.
+- **Zeroization on all paths.** Key material, plaintext, and entry names are zeroized even on error returns within the library.
 
 ## Building
 

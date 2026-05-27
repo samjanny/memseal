@@ -40,15 +40,16 @@
 //!
 //! // Load from disk
 //! let loaded = Vault::load(Path::new("vault.seal"), b"password1234")?;
-//! # Ok::<(), memseal::vault::vault_error::VaultError>(())
+//! # Ok::<(), memseal::VaultError>(())
 //! ```
 
 #![deny(unsafe_code)]
+#![allow(dead_code)]
 
-pub mod constants;
-pub mod crypto;
-pub mod mem;
-pub mod vault;
+mod constants;
+mod crypto;
+mod mem;
+mod vault;
 
 pub use vault::facade::Vault;
 pub use vault::vault_error::VaultError;

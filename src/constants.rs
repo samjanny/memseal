@@ -13,14 +13,11 @@ pub mod argon2 {
 pub mod vault_index_constants {
     pub const VAULT_INDEX_VERSION: u16 = 1;
     pub const SUPPORTED_VAULT_INDEX_VERSIONS: [u16; 1] = [VAULT_INDEX_VERSION];
-    pub const VAULT_INDEX_MAGIC: [u8; 8] = *b"MSEL-IDX";
     pub const MAX_INDEX_ENTRIES: usize = 1024;
 }
 
 pub mod xchacha20_poly1305 {
-    pub const XCHACHA20_POLY1305_KEY_LEN: usize = 32;
     pub const XCHACHA20_NONCE_LEN: usize = 24;
-    pub const XCHACHA20_POLY1305_TAG_LEN: usize = 16;
 }
 
 pub const SECURE_MEMORY_VAULT_CHUNK_SIZE: usize = 4 * 1024; // 4 KiB
