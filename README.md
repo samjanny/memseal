@@ -5,11 +5,19 @@
 [![docs.rs](https://docs.rs/memseal/badge.svg)](https://docs.rs/memseal)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization.
+A small password-based encrypted vault for named secrets, with authenticated encryption, bounded parsing, and explicit memory-hygiene trade-offs.
+
+> **Status:** `memseal` is an experimental `0.x` crate and has **not** been independently audited.
 
 > **Note:** This crate is not a wrapper around Linux `mseal(2)`. "memseal" refers to sealing secrets in an encrypted in-memory vault.
 
-> **Disclaimer**: This library has **not been independently audited**. While it uses well-established cryptographic primitives (XChaCha20-Poly1305, Argon2i, HKDF-SHA256 via [orion](https://crates.io/crates/orion)), the integration has not been reviewed by a third-party security firm. Use at your own risk in production environments. If you find a vulnerability, please see [SECURITY.md](SECURITY.md) for responsible disclosure.
+## Overview
+
+`memseal` stores named secrets in an encrypted vault protected by a password.
+
+It is designed for applications that need a small, self-contained encrypted vault that can be kept in memory, exported to bytes, or saved to disk.
+
+It is **not** a replacement for OS keyrings, HSMs, cloud secret managers, or mature password managers.
 
 ## Quick Start
 
@@ -22,13 +30,33 @@ let mut vault = Vault::create(b"my-password-here").unwrap();
 vault.store("api_key", b"sk-secret-12345").unwrap();
 vault.store("db_url", b"postgres://user:pass@host/db").unwrap();
 
-// Export to bytes (for persistence or transmission)
+// Export to bytes
 let bytes = vault.export().unwrap();
 
 // Reopen with the same password
 let vault = Vault::open(b"my-password-here", &bytes).unwrap();
 let api_key = vault.retrieve("api_key").unwrap();
+
 assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
+```
+
+## File Persistence
+
+```rust
+use memseal::Vault;
+use std::path::Path;
+
+let mut vault = Vault::create(b"my-password-here")?;
+
+vault.store("api_key", b"sk-secret-12345")?;
+
+// Save to disk
+vault.save(Path::new("secrets.seal"))?;
+
+// Later: load and retrieve
+let vault = Vault::load(Path::new("secrets.seal"), b"my-password-here")?;
+let api_key = vault.retrieve("api_key")?;
+# Ok::<(), memseal::VaultError>(())
 ```
 
 ## API
@@ -37,129 +65,220 @@ assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
 use memseal::{Vault, VaultError};
 use std::path::Path;
 
-// Create & open (password must be >= 8 bytes)
+// Create & open
 let mut vault = Vault::create(password)?;
 let vault = Vault::open(password, &bytes)?;
 
 // File I/O
-vault.save(Path::new("vault.seal"))?;          // &mut self (rotates nonce)
+vault.save(Path::new("vault.seal"))?;
 let vault = Vault::load(Path::new("vault.seal"), password)?;
 
 // Store, retrieve, remove
-vault.store("name", b"secret")?;               // name max 255B, data max 64 MiB
-let data = vault.retrieve("name")?;            // Option<Vec<u8>>
-let existed = vault.remove("name")?;           // bool
+vault.store("name", b"secret")?;
+let data = vault.retrieve("name")?;  // Option<Vec<u8>>
+let existed = vault.remove("name")?; // bool
 
 // Export to bytes
-let bytes = vault.export()?;                   // &mut self (rotates nonce)
+let bytes = vault.export()?;
 
-// Change password (re-derives keys, re-encrypts all entries one-at-a-time)
-vault.change_password(b"old-pass", b"new-pass")?;
+// Change password
+vault.change_password(b"old-password", b"new-password")?;
 ```
 
-## Use Cases
+### Limits
 
-- **Secret management** -- Hold API keys, database credentials, or signing keys in memory without exposing plaintext to swap, core dumps, or memory scanners.
-- **Encrypted vaults** -- Store secrets with authenticated encryption. The index hides entry names behind HMAC and protects KDF parameters against downgrade attacks.
-- **Key derivation pipelines** -- Derive purpose-specific subkeys from a master secret using HKDF with domain separation.
-- **Credential caches** -- Cache decrypted credentials with automatic zeroization on drop. Memory is locked with `mlock` to prevent paging to disk.
+| Item | Limit |
+|------|-------|
+| Password length | Minimum 8 bytes |
+| Entry name | Maximum 255 bytes |
+| Entry data | Maximum 64 MiB |
+| Vault file | Maximum 256 MiB |
+| Index entries | Maximum 1024 |
+
+## Handling Plaintext
+
+`retrieve()` returns decrypted data as `Option<Vec<u8>>`.
+
+This is convenient, but it means the caller owns the returned plaintext and is responsible for handling it carefully.
+
+In particular, caller code should avoid:
+
+- logging returned secrets;
+- cloning or converting them unnecessarily;
+- keeping plaintext alive longer than needed;
+- assuming returned plaintext is protected by `mlock`.
+
+Internal temporary plaintext and key material are zeroized where possible, but returned plaintext belongs to the caller.
+
+If the caller wants drop-time zeroization, the returned `Vec<u8>` can be wrapped by the caller using `zeroize::Zeroizing`:
+
+```rust
+use zeroize::Zeroizing;
+
+if let Some(secret) = vault.retrieve("api_key")? {
+    let secret = Zeroizing::new(secret);
+
+    // Use secret here.
+    // This allocation will be zeroized when `secret` is dropped.
+}
+# Ok::<(), memseal::VaultError>(())
+```
+
+This only zeroizes that returned allocation on drop. It does not prevent accidental copies made by caller code or by the allocator/runtime.
+
+## What memseal is
+
+- A small embedded vault for named secrets.
+- Password-based: vault keys are derived from a caller-provided password.
+- Self-contained: vaults can be exported to bytes or saved to disk.
+- Authenticated: encrypted data is protected against tampering.
+- Explicit about its limitations and memory-hygiene trade-offs.
+
+## What memseal is not
+
+- Not independently audited.
+- Not an OS keyring wrapper.
+- Not a cloud secret manager.
+- Not an HSM.
+- Not a password manager.
+- Not a general secure-memory allocator.
+- Not related to Linux `mseal(2)`.
+
+## Intended Use Cases
+
+- **Embedded encrypted vaults** — Store named secrets in an application-managed encrypted vault.
+- **Portable secret bundles** — Export/load a password-protected vault without relying on an OS credential store.
+- **Credential caches** — Keep secrets encrypted at rest in memory and on disk, while accepting explicit caller-owned plaintext boundaries.
+- **Application-managed secret storage** — Store small sets of API keys, tokens, or credentials where a lightweight Rust-native vault is appropriate.
 
 ## Threat Model
 
-### What memseal protects against
+### Intended mitigations
 
 | Threat | Mitigation |
 |--------|------------|
-| **Memory disclosure via swap** | Ciphertext is `mlock`'d to prevent the OS from paging it to disk. |
-| **Cold boot / memory dump** | Data is encrypted at rest in memory with XChaCha20-Poly1305. Internal plaintext is zeroized after use. Note: `retrieve()` returns plaintext as `Vec<u8>` — callers are responsible for zeroizing the returned data. |
-| **Key reuse across operations** | Master key is never used directly. Two distinct subkeys (encryption, HMAC) are derived via HKDF-SHA256 with domain-separated info labels and the KDF salt. |
-| **Nonce reuse** | Nonces are derived deterministically from a monotonic counter via HKDF, not generated randomly. Counter overflow is checked. Index nonce rotated on every export. |
-| **KDF parameter downgrade** | The `VaultHeader` (containing Argon2i params) is passed as AAD to AEAD encryption. Tampering with iterations or memory cost causes authenticated decryption to fail. Header validated against bounds before KDF runs. |
-| **Entry swap attacks** | Each entry's ciphertext is bound to its HMAC'd key and data counter via AAD. Swapping encrypted blobs between entries is detected. |
-| **Entry name leakage** | Index keys are `HMAC-SHA256(hmac_key, name)`, not plaintext. An attacker with access to the serialized index cannot enumerate entry names without the key. |
-| **Use-after-free of secrets** | `SecureMemoryVault` implements `Drop` with zeroization of ciphertext, followed by `munlock`. All temporary key material and plaintext is zeroized on every code path, including errors. |
-| **Tampered ciphertext** | All encryption uses authenticated AEAD (Poly1305 tag). Any bit flip in ciphertext or AAD is detected and rejected. |
-| **Resource exhaustion via crafted files** | Header length, KDF parameters, file size, entry name length, and entry data size are all bounded before processing. |
-| **Weak passwords** | Minimum password length (8 bytes) enforced on vault creation and password change. |
+| **Tampered vault data** | Vault metadata, index data, and entries are protected with authenticated encryption. Bit flips or modified ciphertext are detected. |
+| **Entry swap attacks** | Each entry ciphertext is bound to its HMAC-derived entry key and data counter through AAD. Swapping encrypted blobs between entries is detected. |
+| **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
+| **KDF parameter downgrade** | The vault header is authenticated as AAD. Tampering with KDF parameters causes decryption to fail. Header values are also bounded before KDF execution. |
+| **Nonce reuse** | Nonces are derived from monotonic counters with domain separation. Counter overflow is checked. The index nonce is rotated on each export. |
+| **Key reuse across roles** | The password-derived master key is not used directly for encryption. Separate encryption and HMAC subkeys are derived with HKDF-SHA256. |
+| **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
+| **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, and entry data size are bounded before processing. |
+| **Swap exposure of ciphertext buffers** | Internal ciphertext buffers in `SecureMemoryVault` are locked with `mlock` via `memsec` where supported. |
 
-### What memseal does NOT protect against
+### Out of scope / limitations
 
 | Threat | Reason |
 |--------|--------|
-| **Kernel-level attacker** | A root/kernel attacker can read process memory regardless of mlock. This is a user-space library. |
-| **Side-channel attacks** | No countermeasures against Spectre, cache timing, or power analysis. The crypto primitives (orion) are constant-time where possible. |
-| **Compromised dependencies** | The library trusts its dependency chain (orion, memsec, zeroize). CI runs `cargo audit` on every push. |
-| **Denial of service** | An attacker who can write to the vault data can corrupt it. Integrity is detected, but availability is not guaranteed. |
-| **Debugger-based extraction** | A debugger attached to the process can read decrypted data during `access()` callbacks. Use OS-level protections (`prctl(PR_SET_DUMPABLE, 0)`) to mitigate. |
+| **Kernel-level or root attacker** | A privileged attacker can read process memory regardless of user-space protections. |
+| **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed or after it has been returned by `retrieve()`. |
+| **Caller-owned plaintext leaks** | `retrieve()` returns `Vec<u8>`. The caller is responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
+| **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. |
+| **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
+| **Denial of service** | Corruption is detected, but availability is not guaranteed if an attacker can modify or delete vault data. |
+| **Full swap protection** | Only internal ciphertext buffers are locked. Internal keys, nonces, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
+| **Formal cryptographic assurance** | The crate has not been independently audited. The integration layer should be reviewed before high-risk use. |
 
 ## Architecture
 
-```
+```text
             Password (>= 8 bytes)
                |
-           Argon2i (128 MiB, 4 iterations, random 16B salt)
+           Argon2i
+      128 MiB, 4 iterations
+      random 16-byte salt
                |
           Master Key (32B)
                |
-         HKDF-SHA256 (salt = kdf_salt)
+         HKDF-SHA256
+         salt = KDF salt
           /         \
     enc_subkey    hmac_subkey
       (32B)         (32B)
         |              |
-  SecureMemoryVault  SecureMemoryVault
-  (XChaCha20-Poly1305  (HMAC-SHA256
-   streaming AEAD,      entry name hashing)
-   mlock'd memory)
+        |              +--> HMAC-SHA256 entry-name hashing
         |
-  derive_nonce(enc_key, counter, salt)
-  via HKDF with domain separation
-        |
-  Per-entry: seal_with_aad(key, nonce, data, hmac_key || counter)
+        +--> XChaCha20-Poly1305 encryption
+
+Per-entry encryption:
+  nonce = HKDF(enc_subkey, counter, domain)
+  aad   = HMAC'd entry key || data counter
+  ct    = XChaCha20-Poly1305(key, nonce, plaintext, aad)
+
+Index encryption:
+  index nonce rotates on every export
+  vault header is authenticated as AAD
 ```
+
+Note: `mlock` is applied only to internal ciphertext buffers inside `SecureMemoryVault`. It does not lock every secret-related allocation.
 
 ## Cryptographic Primitives
 
 | Primitive | Implementation | Purpose |
-|-----------|---------------|---------|
-| XChaCha20-Poly1305 (streaming) | orion | In-memory encryption in 4KB chunks |
-| XChaCha20-Poly1305 (single-shot) | orion | AAD-protected encryption of vault index and entries |
-| HKDF-SHA256 | orion | Subkey derivation (with KDF salt), nonce derivation from counter |
-| HMAC-SHA256 | orion | Entry name hashing in vault index |
-| Argon2i | orion | Password-based key derivation |
-| OsRng | rand_core | Cryptographically secure random generation |
+|-----------|----------------|---------|
+| Argon2i | `orion` | Password-based key derivation |
+| HKDF-SHA256 | `orion` | Subkey derivation and nonce derivation |
+| XChaCha20-Poly1305 | `orion` | Authenticated encryption |
+| HMAC-SHA256 | `orion` | Entry-name hashing |
+| OsRng | `rand_core` | Random salt generation |
+| `mlock` / `munlock` | `memsec` | Best-effort locking of internal ciphertext buffers |
+| Zeroization | `zeroize` | Clearing internal temporary secrets where possible |
 
 ## Security Properties
 
-- **`#![deny(unsafe_code)]`** at crate level. Only `secure_memory_vault.rs` allows unsafe for `mlock`/`munlock` syscalls and `unsafe impl Send/Sync` (the struct uses a `Mutex` for interior synchronization and raw pointer fields are only accessed in `Drop`).
-- **Domain separation** for all key derivation: `MEMSEAL_SUBKEY_ENC_v1`, `MEMSEAL_SUBKEY_HMAC_v1`, `MEMSEAL_NONCE_CTR_v1`, `MEMSEAL_DATA_NONCE_v1`, `MEMSEAL_NAME_NONCE_v1`.
-- **Partial swap protection.** Only the ciphertext buffer inside each `SecureMemoryVault` is `mlock`'d. The internal encryption key and nonce reside on the heap without `mlock` — if swapped to disk, they could be recovered. This is a known trade-off.
-- **Caller-owned plaintext.** `retrieve()` returns `Vec<u8>`. Internal temporaries are zeroized, but the returned plaintext is the caller's responsibility to zeroize or limit in scope.
-- **Authenticated encryption everywhere.** No unauthenticated ciphertext path exists. Per-entry AAD prevents entry-swap attacks.
-- **Version validation** on deserialization of `VaultIndex` and `VaultHeader`.
-- **Bounded input processing.** Header length, KDF parameters, file size (256 MiB), entry name (255B), and entry data (64 MiB) are all validated before use.
-- **Zeroization on all paths.** Key material, plaintext, and entry names are zeroized even on error returns within the library.
+- **Small public API.** The crate exposes `Vault` and `VaultError`; internal modules are private.
+- **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for `mlock`/`munlock` and `unsafe impl Send/Sync`.
+- **Domain separation.** Key derivation and nonce derivation use distinct domain labels.
+- **Authenticated encryption.** Vault index data and entries are encrypted with AEAD.
+- **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing.
+- **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix.
+- **Best-effort memory hygiene.** Internal temporary key material and plaintext are zeroized where possible.
+- **Partial swap protection.** Internal ciphertext buffers are locked with `mlock` where supported, but this does not cover every allocation.
 
-## Building
+## Comparison
+
+`memseal` is not a replacement for lower-level memory-hygiene crates such as `zeroize`, `secrecy`, or `memsec`.
+
+It is also not an OS credential-store wrapper like `keyring`.
+
+`memseal` is useful when an application wants a small, portable, self-contained encrypted vault for named secrets that it can export, save, and load directly.
+
+## Development
 
 ```bash
 cargo build
 cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+```
+
+Run benchmarks with:
+
+```bash
 cargo bench --bench full_bench
 ```
 
 ## CI
 
-GitHub Actions runs on every push and PR to `main` (actions SHA-pinned, stable toolchain):
-- `cargo check` -- compilation
-- `cargo fmt --check` -- formatting
-- `cargo clippy -D warnings` -- lints
-- `cargo test` -- unit and doc tests
-- `cargo audit` -- vulnerability scanning
+GitHub Actions runs on every push and PR to `main`:
+
+- `cargo check`
+- `cargo fmt --check`
+- `cargo clippy -- -D warnings`
+- `cargo test`
+- `cargo audit`
 
 ## MSRV
 
-Rust 2024 edition. CI runs stable toolchain.
+`memseal` currently targets the Rust stable toolchain and uses the Rust 2024 edition.
+
+## Security
+
+This crate has not been independently audited.
+
+Please report security issues privately. See [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
