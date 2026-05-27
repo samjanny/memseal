@@ -1,0 +1,41 @@
+[package]
+name = "memseal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization"
+keywords = ["encryption", "secrets", "vault", "memory", "security"]
+categories = ["cryptography"]
+repository = "https://github.com/samjanny/memseal"
+readme = "README.md"
+
+[lib]
+name = "memseal"
+path = "src/lib.rs"
+
+
+[dependencies]
+secrecy = "^0.10"
+zeroize = { version = "^1.8", features = ["derive"] }
+rand_core = { version = "0.9.3", features = ["os_rng"] }
+memsec = "0.7.0"
+orion = "0.17.10"
+thiserror = "2.0.12"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "base_bench"
+harness = false
+
+[[bench]]
+name = "secure_vault_bench"
+harness = false
+
+[[bench]]
+name = "full_bench"
+harness = false

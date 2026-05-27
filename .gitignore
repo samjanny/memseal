@@ -1,0 +1,13 @@
+/target
+.idea/
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+core
+core.*
+*.vault
+*.profdata
+*.profraw
