@@ -481,6 +481,11 @@ impl Vault {
     ) -> Result<(), VaultError> {
         validate_password(new_password)?;
 
+        // Verify current password by exporting and re-opening.
+        // Note: export() advances the nonce counter on self. If the password
+        // check fails, self has a different nonce but is otherwise unchanged
+        // and fully functional. This is acceptable because the nonce counter
+        // is monotonic and the vault data is intact.
         let mut exported = self.export()?;
         let _ = Vault::open(current_password, &exported)?;
         exported.zeroize();
@@ -575,7 +580,8 @@ impl Vault {
 
         old_enc_key.zeroize();
 
-        // Only swap on full success — self is untouched on error
+        // Only swap on full success — on error, self retains old keys/data
+        // (nonce counter may have advanced from the export() verification above)
         loop_result?;
         self.header = new_vault.header;
         self.index = new_vault.index;

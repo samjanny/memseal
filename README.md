@@ -153,7 +153,7 @@ GitHub Actions runs on every push and PR to `main` (actions SHA-pinned, stable t
 - `cargo check` -- compilation
 - `cargo fmt --check` -- formatting
 - `cargo clippy -D warnings` -- lints
-- `cargo test` -- 78 tests (74 unit + 4 doctest)
+- `cargo test` -- unit and doc tests
 - `cargo audit` -- vulnerability scanning
 
 ## MSRV
