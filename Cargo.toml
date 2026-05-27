@@ -1,6 +1,6 @@
 [package]
 name = "memseal"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization"
