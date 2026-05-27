@@ -1,6 +1,8 @@
 # memseal
 
-[![CI](https://github.com/samjanny/valackey_vault/actions/workflows/ci.yml/badge.svg)](https://github.com/samjanny/valackey_vault/actions/workflows/ci.yml)
+[![CI](https://github.com/samjanny/memseal/actions/workflows/ci.yml/badge.svg)](https://github.com/samjanny/memseal/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/memseal.svg)](https://crates.io/crates/memseal)
+[![docs.rs](https://docs.rs/memseal/badge.svg)](https://docs.rs/memseal)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization.
