@@ -178,6 +178,7 @@ This only zeroizes that returned allocation on drop. It does not prevent acciden
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
 | **Denial of service** | Corruption is detected, but availability is not guaranteed if an attacker can modify or delete vault data. |
 | **Full swap protection** | Only internal ciphertext buffers are locked. Internal keys, nonces, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
+| **Rollback protection** | memseal does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless the application stores freshness/version information externally. |
 | **Formal cryptographic assurance** | The crate has not been independently audited. The integration layer should be reviewed before high-risk use. |
 
 ## Architecture
