@@ -520,7 +520,7 @@ impl Vault {
             })
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
 
-        // Build new vault — zeroize both keys on any failure
+        // Build new vault - zeroize both keys on any failure
         let new_index_result = VaultIndex::from_master_key(&new_master_key, &new_header.kdf_salt)
             .map_err(|e| VaultError::CryptoError(e.to_string()));
         new_master_key.zeroize();
@@ -580,7 +580,7 @@ impl Vault {
 
         old_enc_key.zeroize();
 
-        // Only swap on full success — on error, self retains old keys/data
+        // Only swap on full success - on error, self retains old keys/data
         // (nonce counter may have advanced from the export() verification above)
         loop_result?;
         self.header = new_vault.header;
@@ -889,5 +889,86 @@ mod tests {
         let mut data = vec![0u8; 100];
         data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(Vault::open(b"password", &data).is_err());
+    }
+
+    // Tampering group A: raw-bytes truncation and boundary checks.
+    // These test the bounded parsing logic of `Vault::open` independent of
+    // header content or ciphertext validity.
+
+    fn make_valid_export(password: &[u8]) -> Vec<u8> {
+        let mut vault = Vault::create(password).unwrap();
+        vault.store("k", b"v").unwrap();
+        vault.export().unwrap()
+    }
+
+    #[test]
+    fn open_rejects_empty_input() {
+        let result = Vault::open(b"password", &[]);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_input_below_header_len_field() {
+        let result = Vault::open(b"password", &[0u8, 0, 0]);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_zero_header_len() {
+        // 4 bytes containing header_len=0, plus enough trailing bytes to clear
+        // the size check. Header JSON region is empty so deserialization fails.
+        let mut data = vec![0u8; 4 + XCHACHA20_NONCE_LEN + 8];
+        data[..4].copy_from_slice(&0u32.to_le_bytes());
+        let result = Vault::open(b"password", &data);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_len_exceeding_available_bytes() {
+        // header_len within MAX_VAULT_FILE_SIZE but larger than provided bytes.
+        // Exercises the `data.len() < min_total` branch, distinct from the
+        // `header_len > MAX_VAULT_FILE_SIZE` branch covered by
+        // `header_len_overflow_rejected`.
+        let mut data = vec![0u8; 64];
+        data[..4].copy_from_slice(&10_000u32.to_le_bytes());
+        let result = Vault::open(b"password", &data);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_truncation_inside_nonce_region() {
+        // Truncate a valid export inside the 24-byte nonce region.
+        let valid = make_valid_export(b"password-aaaa");
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let nonce_start = 4 + header_len;
+        // Keep half of the nonce so the size check fails.
+        let truncated = &valid[..nonce_start + XCHACHA20_NONCE_LEN / 2];
+        let result = Vault::open(b"password-aaaa", truncated);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_truncation_inside_counter_region() {
+        // Truncate a valid export inside the 8-byte counter region.
+        let valid = make_valid_export(b"password-bbbb");
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let counter_start = 4 + header_len + XCHACHA20_NONCE_LEN;
+        // Keep half of the counter so the size check fails.
+        let truncated = &valid[..counter_start + 4];
+        let result = Vault::open(b"password-bbbb", truncated);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_missing_ciphertext_after_counter() {
+        // Header + nonce + counter present, but the ciphertext region is empty
+        // (no AEAD tag). The size check passes; AEAD must reject the input.
+        // `open_with_aad` failures are surfaced as `InvalidPassword` by design.
+        let valid = make_valid_export(b"password-cccc");
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let cut = 4 + header_len + XCHACHA20_NONCE_LEN + 8;
+        let truncated = &valid[..cut];
+        let result = Vault::open(b"password-cccc", truncated);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
 }
