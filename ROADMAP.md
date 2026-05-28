@@ -1,6 +1,6 @@
 # Roadmap
 
-## 0.1.x — Stabilization
+## 0.1.x - Stabilization
 
 - Improve documentation and threat model wording.
 - Add `CHANGELOG.md`.
@@ -8,13 +8,13 @@
 - Add `DESIGN.md` describing the vault format, key derivation, nonce derivation, and AAD.
 - Expand tampering/corruption tests.
 
-## 0.2.x — Plaintext access API
+## 0.2.x - Plaintext access API
 
 - Add a callback-based access API for short-lived plaintext use.
 - Keep `retrieve()` for convenience, but document it as caller-owned plaintext.
 - Improve examples around plaintext handling.
 
-## 0.3.x — KDF configuration and review
+## 0.3.x - KDF configuration and review
 
 - Revisit Argon2i vs Argon2id.
 - Decide whether to keep Argon2i as a documented trade-off or introduce Argon2id for new vaults.
@@ -25,13 +25,13 @@
 - Reject unsafe, malformed, or resource-exhaustive KDF parameters when opening vaults.
 - Preserve compatibility with existing vault formats where possible.
 
-## 0.4.x — Format and threat-model documentation
+## 0.4.x - Format and threat-model documentation
 
 - Publish a precise vault format document.
 - Document serialization, authenticated data, counters, nonce derivation, KDF parameters, and versioning.
 - Add test vectors.
 
-## 0.5.x — Hardening
+## 0.5.x - Hardening
 
 - Add fuzzing for vault parsing.
 - Improve error taxonomy.
