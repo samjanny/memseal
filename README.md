@@ -153,16 +153,18 @@ This only zeroizes that returned allocation on drop. It does not prevent acciden
 
 ## Threat Model
 
+For the exact byte format, key derivation chain, nonce derivation, and AAD bindings that back these claims, see [DESIGN.md](DESIGN.md).
+
 ### Intended mitigations
 
 | Threat | Mitigation |
 |--------|------------|
-| **Tampered vault data** | Vault metadata, index data, and entries are protected with authenticated encryption. Bit flips or modified ciphertext are detected. |
-| **Entry swap attacks** | Each entry ciphertext is bound to its HMAC-derived entry key and data counter through AAD. Swapping encrypted blobs between entries is detected. |
+| **Tampered vault data** | The vault header is authenticated as AAD for index decryption; the index JSON and every per-entry payload are encrypted and authenticated with XChaCha20-Poly1305. Bit flips in authenticated header fields, nonces, ciphertext, or Poly1305 tags are detected during `open()` or entry retrieval. |
+| **Entry swap attacks** | Each entry's data and name ciphertexts share an AAD made of the entry's HMAC-derived key and its `data_counter`. Swapping either the encrypted data or the encrypted name across entries causes AEAD verification to fail. |
 | **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
-| **KDF parameter downgrade** | The vault header is authenticated as AAD. Tampering with KDF parameters causes decryption to fail. Header values are also bounded before KDF execution. |
-| **Nonce reuse** | Nonces are derived from monotonic counters with domain separation. Counter overflow is checked. The index nonce is rotated on each export. |
-| **Key reuse across roles** | The password-derived master key is not used directly for encryption. Separate encryption and HMAC subkeys are derived with HKDF-SHA256. |
+| **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: out-of-range values (for example, below-minimum memory cost or zero iterations) are rejected by `validate_header()` during `open()`, blocking forged headers that would make password guessing artificially cheap. |
+| **Nonce reuse** | Nonces are derived deterministically via HKDF-SHA256 from monotonic counters. The index stream uses its own counter; entry data and entry name nonces use the entry `data_counter` with disjoint HKDF `info` prefixes for domain separation. Counter overflow at `u64::MAX` is a hard error. The index nonce is rotated on every `export()`. |
+| **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
 | **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, and entry data size are bounded before processing. |
 | **Swap exposure of ciphertext buffers** | Internal ciphertext buffers in `SecureMemoryVault` are locked with `mlock` via `memsec` where supported. |
@@ -176,7 +178,7 @@ This only zeroizes that returned allocation on drop. It does not prevent acciden
 | **Caller-owned plaintext leaks** | `retrieve()` returns `Vec<u8>`. The caller is responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
 | **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. |
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
-| **Denial of service** | Corruption is detected, but availability is not guaranteed if an attacker can modify or delete vault data. |
+| **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |
 | **Full swap protection** | Only internal ciphertext buffers are locked. Internal keys, nonces, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
 | **Rollback protection** | memseal does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless the application stores freshness/version information externally. |
 | **Formal cryptographic assurance** | The crate has not been independently audited. The integration layer should be reviewed before high-risk use. |

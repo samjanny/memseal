@@ -32,6 +32,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Documentation
 
 * Documented that `memseal` does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless freshness is tracked externally.
+* Refined the threat model wording in `README.md`: clarified what is authenticated vs encrypted, made the AAD binding explicit for entry-swap and entry-name-swap, made the rationale for KDF parameter bounds explicit, described nonce derivation in terms of HKDF streams with disjoint `info` prefixes, and reframed the DoS limitation as a backup/replication responsibility for integrators.
+* Linked the `README.md` threat model to `DESIGN.md` so that each claim points to the byte-level construction that backs it.
 
 ## [0.1.3] - 2026-05-27
 
