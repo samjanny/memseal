@@ -146,10 +146,10 @@ This only zeroizes that returned allocation on drop. It does not prevent acciden
 
 ## Intended Use Cases
 
-- **Embedded encrypted vaults** — Store named secrets in an application-managed encrypted vault.
-- **Portable secret bundles** — Export/load a password-protected vault without relying on an OS credential store.
-- **Credential caches** — Keep secrets encrypted at rest in memory and on disk, while accepting explicit caller-owned plaintext boundaries.
-- **Application-managed secret storage** — Store small sets of API keys, tokens, or credentials where a lightweight Rust-native vault is appropriate.
+- **Embedded encrypted vaults** - Store named secrets in an application-managed encrypted vault.
+- **Portable secret bundles** - Export/load a password-protected vault without relying on an OS credential store.
+- **Credential caches** - Keep secrets encrypted at rest in memory and on disk, while accepting explicit caller-owned plaintext boundaries.
+- **Application-managed secret storage** - Store small sets of API keys, tokens, or credentials where a lightweight Rust-native vault is appropriate.
 
 ## Threat Model
 
@@ -204,8 +204,8 @@ This only zeroizes that returned allocation on drop. It does not prevent acciden
 
 Per-entry encryption:
   nonce = HKDF(enc_subkey, counter, domain)
-  aad   = HMAC'd entry key || data counter
-  ct    = XChaCha20-Poly1305(key, nonce, plaintext, aad)
+  aad   = hex(HMAC-SHA256(hmac_subkey, plaintext_name)) || data_counter (u64 LE)
+  ct    = XChaCha20-Poly1305(enc_subkey, nonce, plaintext, aad)
 
 Index encryption:
   index nonce rotates on every export
@@ -264,11 +264,11 @@ cargo bench --bench full_bench
 
 GitHub Actions runs on every push and PR to `main`:
 
-- `cargo check`
-- `cargo fmt --check`
-- `cargo clippy -- -D warnings`
+- `cargo check --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo test`
-- `cargo audit`
+- `rustsec/audit-check` action
 
 ## MSRV
 
@@ -282,4 +282,4 @@ Please report security issues privately. See [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
