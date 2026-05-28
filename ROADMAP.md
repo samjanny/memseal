@@ -13,6 +13,11 @@
 - Add a callback-based access API for short-lived plaintext use.
 - Keep `retrieve()` for convenience, but document it as caller-owned plaintext.
 - Improve examples around plaintext handling.
+- Clean up the on-disk vault format: drop the 8-byte `nonce_counter` field
+  written by `export()` at offset `4 + header_len + 24`. It is never read
+  back by `open()` (the authoritative counter is recovered from the
+  encrypted index JSON), so it is dead weight. Requires a `VAULT_VERSION`
+  bump and is acceptable here because 0.2.x already ships an API break.
 
 ## 0.3.x - KDF configuration and review
 

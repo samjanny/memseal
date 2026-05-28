@@ -1084,4 +1084,91 @@ mod tests {
         let result = Vault::open(password, &tampered);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
+
+    // Tampering group C: nonce and counter region tampering.
+    // The nonce is part of the AEAD construction; tampering must surface as
+    // an AEAD failure. The counter field stored in the file at the fixed
+    // offset is an export of vault state but is not consumed by `open()`
+    // (the authoritative counter values are inside the encrypted index JSON).
+
+    #[test]
+    fn open_rejects_bit_flipped_nonce() {
+        let password: &[u8] = b"password-iiii";
+        let valid = make_valid_export(password);
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let nonce_start = 4 + header_len;
+
+        let mut tampered = valid.clone();
+        // Flip the first byte of the 24-byte nonce.
+        tampered[nonce_start] ^= 0x01;
+
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_ignores_counter_field_in_file() {
+        // The 8-byte counter field written by `export()` at offset
+        // `4 + header_len + 24` is never read back by `open()`; the
+        // authoritative counter is recovered from the encrypted index JSON.
+        // This test pins that behavior: flipping every bit of those 8 bytes
+        // must NOT change the outcome of `open()`. If this test ever starts
+        // failing, the file format is being used differently and the layout
+        // should be revisited (the 8 bytes are otherwise wire-format dead
+        // weight that should either be removed or actually consumed).
+        let password: &[u8] = b"password-jjjj";
+        let valid = make_valid_export(password);
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let counter_start = 4 + header_len + XCHACHA20_NONCE_LEN;
+
+        let mut tampered = valid.clone();
+        for i in 0..8 {
+            tampered[counter_start + i] ^= 0xFF;
+        }
+
+        let from_valid = Vault::open(password, &valid).unwrap();
+        let from_tampered = Vault::open(password, &tampered).unwrap();
+        // Both opens succeed and recover the same authoritative counter.
+        assert_eq!(
+            from_valid.index.nonce_counter,
+            from_tampered.index.nonce_counter
+        );
+    }
+
+    #[test]
+    fn open_rejects_replaying_old_nonce_into_new_export() {
+        // Each `export()` rotates the nonce. Splicing the nonce from an
+        // earlier export onto a later export's ciphertext must fail because
+        // the ciphertext was sealed with the later nonce; the AAD also
+        // authenticates the header but the nonce is what the AEAD uses to
+        // decrypt.
+        let password: &[u8] = b"password-kkkk";
+        let mut vault = Vault::create(password).unwrap();
+        vault.store("k", b"v").unwrap();
+
+        let export_first = vault.export().unwrap();
+        let export_second = vault.export().unwrap();
+
+        let header_len_first = u32::from_le_bytes(export_first[..4].try_into().unwrap()) as usize;
+        let header_len_second = u32::from_le_bytes(export_second[..4].try_into().unwrap()) as usize;
+        // The two exports share the same header (same KDF params and salt),
+        // so the nonce offset is the same in both.
+        assert_eq!(header_len_first, header_len_second);
+
+        let nonce_start = 4 + header_len_second;
+        let old_nonce =
+            &export_first[4 + header_len_first..4 + header_len_first + XCHACHA20_NONCE_LEN];
+
+        let mut tampered = export_second.clone();
+        tampered[nonce_start..nonce_start + XCHACHA20_NONCE_LEN].copy_from_slice(old_nonce);
+
+        // Sanity: the spliced nonce really differs from the second export's nonce.
+        assert_ne!(
+            &export_second[nonce_start..nonce_start + XCHACHA20_NONCE_LEN],
+            old_nonce
+        );
+
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
 }

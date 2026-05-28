@@ -11,6 +11,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 * Added `ROADMAP.md` outlining planned milestones for the `0.1.x` through `0.5.x` lines.
 
+### Tests
+
+* Added tampering and boundary tests for `Vault::open`, covering: raw-bytes
+  truncation and length checks; header JSON tampering (malformed JSON,
+  missing fields, unsupported version, out-of-range KDF parameters);
+  AAD divergence via salt modification and cross-vault header swap; nonce
+  bit-flips and nonce replay between exports.
+
+### Notes
+
+* The 8-byte `nonce_counter` field that `export()` writes at offset
+  `4 + header_len + 24` is currently never read by `open()`. The
+  authoritative counter is recovered from the encrypted index JSON. The
+  field is wire-format dead weight; a test now pins this behavior. Cleanup
+  is scheduled for `0.2.x` because removing the field is a vault format
+  break.
+
 ### Documentation
 
 * Documented that `memseal` does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless freshness is tracked externally.
