@@ -10,6 +10,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Added
 
 * Added `ROADMAP.md` outlining planned milestones for the `0.1.x` through `0.5.x` lines.
+* Added `DESIGN.md` describing the on-disk vault format, the key and nonce derivation chains, the AAD bindings, per-entry encryption, bounded parsing rules, and the current format oddities.
 
 ### Tests
 
