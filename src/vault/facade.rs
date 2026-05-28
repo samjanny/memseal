@@ -971,4 +971,117 @@ mod tests {
         let result = Vault::open(b"password-cccc", truncated);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
+
+    // Tampering group B: header JSON tampering and AAD divergence.
+    // The vault header is serialized as JSON and used as AAD for index
+    // encryption. Any modification must either be rejected by parsing/
+    // validation or surface as an AEAD failure (`InvalidPassword`).
+
+    fn replace_header_json(export: &[u8], new_header_json: &[u8]) -> Vec<u8> {
+        let old_header_len = u32::from_le_bytes(export[..4].try_into().unwrap()) as usize;
+        let after_old_header = 4 + old_header_len;
+        let mut out =
+            Vec::with_capacity(4 + new_header_json.len() + export.len() - after_old_header);
+        out.extend_from_slice(&(new_header_json.len() as u32).to_le_bytes());
+        out.extend_from_slice(new_header_json);
+        out.extend_from_slice(&export[after_old_header..]);
+        out
+    }
+
+    fn extract_header_value(export: &[u8]) -> serde_json::Value {
+        let header_len = u32::from_le_bytes(export[..4].try_into().unwrap()) as usize;
+        serde_json::from_slice(&export[4..4 + header_len]).unwrap()
+    }
+
+    #[test]
+    fn open_rejects_malformed_header_json() {
+        let valid = make_valid_export(b"password-dddd");
+        let tampered = replace_header_json(&valid, b"{");
+        let result = Vault::open(b"password-dddd", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_missing_required_field() {
+        let valid = make_valid_export(b"password-eeee");
+        let mut value = extract_header_value(&valid);
+        // Drop the `version` field; deserialization must fail because
+        // VaultHeader fields have no serde defaults.
+        value.as_object_mut().unwrap().remove("version");
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-eeee", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_with_unsupported_version() {
+        let valid = make_valid_export(b"password-ffff");
+        let mut value = extract_header_value(&valid);
+        value.as_object_mut().unwrap().insert(
+            "version".to_string(),
+            serde_json::Value::Number(999u16.into()),
+        );
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-ffff", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_with_out_of_range_kdf_memory() {
+        // Exercises validate_header() through the full open() path, distinct
+        // from the unit test that calls validate_header() in isolation.
+        let valid = make_valid_export(b"password-gggg");
+        let mut value = extract_header_value(&valid);
+        value.as_object_mut().unwrap().insert(
+            "kdf_memory_cost".to_string(),
+            serde_json::Value::Number((MAX_KDF_MEMORY + 1).into()),
+        );
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-gggg", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_with_modified_salt() {
+        // Salt is part of the header AAD AND drives master key derivation.
+        // Both effects independently force AEAD to fail; surfaced as
+        // InvalidPassword.
+        let valid = make_valid_export(b"password-hhhh");
+        let mut value = extract_header_value(&valid);
+        let salt = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("kdf_salt")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        // Flip a byte in the salt.
+        let first = salt[0].as_u64().unwrap();
+        salt[0] = serde_json::Value::Number((first ^ 0xFF & 0xFF).into());
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-hhhh", &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_rejects_cross_vault_header_swap() {
+        // Two vaults created with the same password produce different headers
+        // (different random salts). Swapping the header of vault A onto the
+        // ciphertext of vault B must fail: the header bytes are bound to the
+        // index ciphertext as AAD, and the salt drives master key derivation.
+        let password: &[u8] = b"shared-password";
+        let export_a = make_valid_export(password);
+        let export_b = make_valid_export(password);
+
+        let header_len_a = u32::from_le_bytes(export_a[..4].try_into().unwrap()) as usize;
+        let header_a_json = &export_a[4..4 + header_len_a];
+
+        let tampered = replace_header_json(&export_b, header_a_json);
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
 }
