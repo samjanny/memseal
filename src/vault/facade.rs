@@ -1171,4 +1171,75 @@ mod tests {
         let result = Vault::open(password, &tampered);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
+
+    // Tampering group D: ciphertext region tampering.
+    // The ciphertext is XChaCha20-Poly1305 sealed: any modification to
+    // either the encrypted payload or the 16-byte authentication tag must
+    // cause AEAD verification to fail.
+
+    const POLY1305_TAG_LEN: usize = 16;
+
+    fn ciphertext_offset(export: &[u8]) -> usize {
+        let header_len = u32::from_le_bytes(export[..4].try_into().unwrap()) as usize;
+        4 + header_len + XCHACHA20_NONCE_LEN + 8
+    }
+
+    #[test]
+    fn open_rejects_bit_flip_in_ciphertext_body() {
+        // Flip a bit at the start of the AEAD ciphertext (before the trailing
+        // tag). This targets the encrypted payload, not the tag.
+        let password: &[u8] = b"password-llll";
+        let valid = make_valid_export(password);
+        let ct_start = ciphertext_offset(&valid);
+        // Sanity: there must be at least one byte of body before the 16-byte tag.
+        assert!(valid.len() > ct_start + POLY1305_TAG_LEN);
+
+        let mut tampered = valid.clone();
+        tampered[ct_start] ^= 0x01;
+
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_rejects_bit_flip_in_poly1305_tag() {
+        // Flip a bit in the middle of the 16-byte Poly1305 tag. Distinct from
+        // the existing `tampered_export_fails_open` test which flips the very
+        // last byte; here we hit a non-edge byte of the tag region.
+        let password: &[u8] = b"password-mmmm";
+        let valid = make_valid_export(password);
+        let tag_mid = valid.len() - POLY1305_TAG_LEN + (POLY1305_TAG_LEN / 2);
+
+        let mut tampered = valid.clone();
+        tampered[tag_mid] ^= 0x40;
+
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_rejects_ciphertext_with_tag_stripped() {
+        // Remove the trailing 16-byte Poly1305 tag entirely. AEAD must reject.
+        let password: &[u8] = b"password-nnnn";
+        let valid = make_valid_export(password);
+        let truncated = &valid[..valid.len() - POLY1305_TAG_LEN];
+
+        let result = Vault::open(password, truncated);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_rejects_ciphertext_with_trailing_garbage_appended() {
+        // Append junk after the tag. Without the original tag positioned at
+        // end-of-input, AEAD verification reads the wrong bytes as the tag
+        // and fails.
+        let password: &[u8] = b"password-oooo";
+        let valid = make_valid_export(password);
+
+        let mut tampered = valid.clone();
+        tampered.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+
+        let result = Vault::open(password, &tampered);
+        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
 }
