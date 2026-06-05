@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-05
+
 ### Security
 
 * The decrypted index buffer in `Vault::open` and the serialized header and index buffers in `Vault::export` are now wrapped in `zeroize::Zeroizing`, so index metadata (HMAC-derived entry names, nonce counters, structure) is cleared from memory on scope exit instead of lingering in freed allocations. This brings these buffers in line with the existing zeroization of key material.
@@ -89,7 +91,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/samjanny/memseal/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/samjanny/memseal/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/samjanny/memseal/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/samjanny/memseal/compare/v0.1.0...v0.1.1
