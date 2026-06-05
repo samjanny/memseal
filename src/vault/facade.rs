@@ -32,7 +32,7 @@ use crate::constants::{
 };
 use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
 use crate::crypto::utils::secure_bytes_fill;
-use crate::mem::secure_memory_vault::MemoryVaultError;
+use crate::mem::secure_memory_vault::{MemoryVaultError, SecureMemoryVault};
 use crate::vault::vault_error::VaultError;
 use crate::vault::vault_header::VaultHeader;
 use crate::vault::vault_index::{
@@ -149,8 +149,13 @@ impl Vault {
             enc_sub = e;
 
             let aad = header.to_aad_bytes()?;
-            let index_json = open_with_aad(&enc_sub, &nonce, encrypted_index, &aad)
-                .map_err(|_| VaultError::InvalidPassword)?;
+            // Wrap in Zeroizing so the decrypted index (HMAC entry names, nonce
+            // counters, structural metadata) is cleared on scope exit, matching
+            // how master_key and enc_sub are handled below.
+            let index_json = zeroize::Zeroizing::new(
+                open_with_aad(&enc_sub, &nonce, encrypted_index, &aad)
+                    .map_err(|_| VaultError::InvalidPassword)?,
+            );
 
             #[derive(serde::Deserialize)]
             struct IndexData {
@@ -170,6 +175,15 @@ impl Vault {
                 return Err(VaultError::CorruptedData(format!(
                     "Unsupported index version: {}",
                     idx_data.version
+                )));
+            }
+
+            let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+            if idx_data.files.len() > max_index_entries {
+                return Err(VaultError::CorruptedData(format!(
+                    "Index entry count {} exceeds maximum {}",
+                    idx_data.files.len(),
+                    max_index_entries
                 )));
             }
 
@@ -235,33 +249,23 @@ impl Vault {
 
         let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
 
-        let mut enc_key_bytes = [0u8; 32];
-        let mut data_nonce = [0u8; XCHACHA20_NONCE_LEN];
-        let mut name_nonce = [0u8; XCHACHA20_NONCE_LEN];
+        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
 
         let salt = self.index.kdf_salt().to_vec();
-        enc_vault
-            .access(|chunk, _tag| {
-                if chunk.len() >= 32 {
-                    enc_key_bytes.copy_from_slice(&chunk[..32]);
-                }
-                data_nonce = derive_nonce_with_prefix(
-                    &enc_key_bytes,
-                    data_counter,
-                    DATA_NONCE_HKDF_INFO_PREFIX,
-                    &salt,
-                )
-                .map_err(|e| MemoryVaultError::GenericError(e.to_string()))?;
-                name_nonce = derive_nonce_with_prefix(
-                    &enc_key_bytes,
-                    data_counter,
-                    NAME_NONCE_HKDF_INFO_PREFIX,
-                    &salt,
-                )
-                .map_err(|e| MemoryVaultError::GenericError(e.to_string()))?;
-                Ok(())
-            })
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let data_nonce = derive_nonce_with_prefix(
+            &enc_key_bytes,
+            data_counter,
+            DATA_NONCE_HKDF_INFO_PREFIX,
+            &salt,
+        )
+        .inspect_err(|_| enc_key_bytes.zeroize())?;
+        let name_nonce = derive_nonce_with_prefix(
+            &enc_key_bytes,
+            data_counter,
+            NAME_NONCE_HKDF_INFO_PREFIX,
+            &salt,
+        )
+        .inspect_err(|_| enc_key_bytes.zeroize())?;
 
         // Compute HMAC'd key for AAD binding (prevents entry-swap attacks)
         let hmac_key = self
@@ -339,15 +343,7 @@ impl Vault {
 
         let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
 
-        let mut enc_key_bytes = [0u8; 32];
-        enc_vault
-            .access(|chunk, _tag| {
-                if chunk.len() >= 32 {
-                    enc_key_bytes.copy_from_slice(&chunk[..32]);
-                }
-                Ok(())
-            })
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
 
         let nonce: [u8; XCHACHA20_NONCE_LEN] = encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
         let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
@@ -389,22 +385,22 @@ impl Vault {
             .advance_nonce()
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
 
-        let header_json = serde_json::to_vec(&self.header)
-            .map_err(|e| VaultError::SerializationError(e.to_string()))?;
+        // Wrap in Zeroizing so the serialized header and index buffers are
+        // cleared on scope exit. header_json carries only public KDF params,
+        // but index_json carries structural metadata; clear both for
+        // consistency with the rest of the key-handling in this file.
+        let header_json = zeroize::Zeroizing::new(
+            serde_json::to_vec(&self.header)
+                .map_err(|e| VaultError::SerializationError(e.to_string()))?,
+        );
 
-        let index_json = serde_json::to_vec(&self.index)
-            .map_err(|e| VaultError::SerializationError(e.to_string()))?;
+        let index_json = zeroize::Zeroizing::new(
+            serde_json::to_vec(&self.index)
+                .map_err(|e| VaultError::SerializationError(e.to_string()))?,
+        );
 
         let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let mut enc_key_bytes = [0u8; 32];
-        enc_vault
-            .access(|chunk, _tag| {
-                if chunk.len() >= 32 {
-                    enc_key_bytes.copy_from_slice(&chunk[..32]);
-                }
-                Ok(())
-            })
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
 
         let aad = self.header.to_aad_bytes()?;
         let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_json, &aad)
@@ -510,15 +506,9 @@ impl Vault {
             .collect();
 
         let old_enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let mut old_enc_key = [0u8; 32];
-        old_enc_vault
-            .access(|chunk, _tag| {
-                if chunk.len() >= 32 {
-                    old_enc_key.copy_from_slice(&chunk[..32]);
-                }
-                Ok(())
-            })
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let mut old_enc_key = extract_enc_key(old_enc_vault).inspect_err(|_| {
+            new_master_key.zeroize();
+        })?;
 
         // Build new vault - zeroize both keys on any failure
         let new_index_result = VaultIndex::from_master_key(&new_master_key, &new_header.kdf_salt)
@@ -636,6 +626,39 @@ fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
     aad
 }
 
+/// Copies the 32-byte encryption subkey out of the secure memory vault.
+///
+/// The subkey is always exactly 32 bytes (HKDF-SHA256 output). A shorter
+/// chunk is treated as a hard error rather than being silently ignored, which
+/// would otherwise leave the key buffer all-zero and lead to encryption or
+/// decryption under a known zero key.
+fn extract_enc_key(enc_vault: &SecureMemoryVault) -> Result<[u8; 32], VaultError> {
+    let mut enc_key_bytes = [0u8; 32];
+    let mut copied = false;
+    enc_vault
+        .access(|chunk, _tag| {
+            if chunk.len() < 32 {
+                return Err(MemoryVaultError::GenericError(
+                    "encryption subkey shorter than 32 bytes".to_string(),
+                ));
+            }
+            enc_key_bytes.copy_from_slice(&chunk[..32]);
+            copied = true;
+            Ok(())
+        })
+        .map_err(|e| {
+            enc_key_bytes.zeroize();
+            VaultError::CryptoError(e.to_string())
+        })?;
+    if !copied {
+        enc_key_bytes.zeroize();
+        return Err(VaultError::CryptoError(
+            "encryption subkey unavailable".to_string(),
+        ));
+    }
+    Ok(enc_key_bytes)
+}
+
 fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_LEN], VaultError> {
     let mut master_key = [0u8; KEY_LEN];
     argon2i::derive_key(
@@ -671,6 +694,36 @@ fn derive_nonce_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
+        let key = [7u8; 32];
+        let vault = SecureMemoryVault::new(&key).unwrap();
+        let extracted = extract_enc_key(&vault).unwrap();
+        assert_eq!(extracted, key);
+    }
+
+    #[test]
+    fn extract_enc_key_rejects_short_subkey() {
+        // A subkey shorter than 32 bytes must be a hard error rather than a
+        // silent fall-through that would leave the key buffer all-zero and
+        // lead to encryption under a known zero key.
+        let short = [1u8; 16];
+        let vault = SecureMemoryVault::new(&short).unwrap();
+        assert!(matches!(
+            extract_enc_key(&vault),
+            Err(VaultError::CryptoError(_))
+        ));
+    }
+
+    #[test]
+    fn extract_enc_key_rejects_empty_subkey() {
+        let vault = SecureMemoryVault::new(&[]).unwrap();
+        assert!(matches!(
+            extract_enc_key(&vault),
+            Err(VaultError::CryptoError(_))
+        ));
+    }
 
     #[test]
     fn create_and_export_open_roundtrip() {
@@ -1241,5 +1294,91 @@ mod tests {
 
         let result = Vault::open(password, &tampered);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    // Tampering group E: index entry-count cap.
+    // `open()` must reject an index whose decoded `files` map exceeds
+    // MAX_INDEX_ENTRIES, even though the bytes are validly sealed under the
+    // correct key. This guards against a crafted index forcing a larger
+    // in-memory map than the format allows.
+
+    /// Forges a vault export whose encrypted index contains `entry_count`
+    /// entries, sealed correctly under the key derived from `password`.
+    fn forge_export_with_entries(password: &[u8], entry_count: usize) -> Vec<u8> {
+        use crate::vault::vault_index::derive_subkeys;
+
+        let header = VaultHeader::generate().unwrap();
+        let mut master_key = derive_master_key(password, &header).unwrap();
+        let (mut enc_sub, _hmac_sub) = derive_subkeys(&master_key, &header.kdf_salt).unwrap();
+        master_key.zeroize();
+
+        let mut files = std::collections::HashMap::new();
+        for i in 0..entry_count {
+            files.insert(
+                format!("{:064x}", i),
+                IndexMetaBlockMetadata::new(
+                    IndexMetaBlockLocation::Inline,
+                    0,
+                    0,
+                    true,
+                    None,
+                    None,
+                    0,
+                ),
+            );
+        }
+
+        let nonce = derive_nonce_with_prefix(
+            &enc_sub,
+            1,
+            crate::constants::nonce_derivation::NONCE_HKDF_INFO_PREFIX,
+            &header.kdf_salt,
+        )
+        .unwrap();
+
+        // All forged entries use data_counter 0, so data_nonce_counter must be
+        // at least 1 to satisfy the nonce-counter invariant enforced on open.
+        let index_json = serde_json::json!({
+            "version": crate::constants::vault_index_constants::VAULT_INDEX_VERSION,
+            "nonce": nonce.to_vec(),
+            "nonce_counter": 1u64,
+            "data_nonce_counter": 1u64,
+            "files": files,
+        });
+        let index_bytes = serde_json::to_vec(&index_json).unwrap();
+
+        let aad = header.to_aad_bytes().unwrap();
+        let encrypted_index = seal_with_aad(&enc_sub, &nonce, &index_bytes, &aad).unwrap();
+        enc_sub.zeroize();
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let mut output = Vec::new();
+        output.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        output.extend_from_slice(&header_json);
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&1u64.to_le_bytes());
+        output.extend_from_slice(&encrypted_index);
+        output
+    }
+
+    #[test]
+    fn open_accepts_index_at_entry_cap() {
+        let password: &[u8] = b"password-cap-ok";
+        let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+        let data = forge_export_with_entries(password, max);
+        // Sealed correctly and at the cap: open must succeed.
+        assert!(Vault::open(password, &data).is_ok());
+    }
+
+    #[test]
+    fn open_rejects_index_over_entry_cap() {
+        let password: &[u8] = b"password-cap-no";
+        let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+        let data = forge_export_with_entries(password, max + 1);
+        // One past the cap: open must reject as corrupted, not build the map.
+        assert!(matches!(
+            Vault::open(password, &data),
+            Err(VaultError::CorruptedData(_))
+        ));
     }
 }

@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+* The decrypted index buffer in `Vault::open` and the serialized header and index buffers in `Vault::export` are now wrapped in `zeroize::Zeroizing`, so index metadata (HMAC-derived entry names, nonce counters, structure) is cleared from memory on scope exit instead of lingering in freed allocations. This brings these buffers in line with the existing zeroization of key material.
+* `Vault::open` now rejects an index whose decoded `files` map exceeds `MAX_INDEX_ENTRIES` (1024), closing a denial-of-service gap where a crafted vault file could force a larger in-memory map than the format allows. The cap was previously enforced only on `insert_file`.
+* On reopen, `VaultIndex::from_master_key_and_data` now enforces that `data_nonce_counter` is strictly greater than the largest stored `data_counter`. This prevents a later `store` from reusing a per-entry data nonce when the (authenticated) index is inconsistent.
+* The encryption subkey extraction in `Vault::store`, `retrieve`, `export`, and `change_password` now fails hard if the subkey is shorter than 32 bytes instead of silently leaving the key buffer all-zero, removing a latent path to encryption under a known zero key. The duplicated extraction logic is consolidated into a single helper.
+
 ### Added
 
 * Added `ROADMAP.md` outlining planned milestones for the `0.1.x` through `0.5.x` lines.
