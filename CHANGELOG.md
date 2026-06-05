@@ -16,7 +16,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Documentation
 
-* Made the README code examples self-contained and runnable: wrapped the file-persistence, API-summary, and plaintext-handling snippets in `fn main() -> Result<(), VaultError>` blocks, removed the hidden rustdoc `# Ok::<...>` lines, and defined previously undefined `password`/`bytes` bindings in the API summary.
+* Made the README code examples self-contained and runnable: wrapped the file-persistence, API-summary, and plaintext-handling snippets in `fn main() -> Result<(), VaultError>` blocks, removed the hidden rustdoc `# Ok::<...>` lines, and defined previously undefined `password`/`bytes` bindings in the API summary. The examples now compile cleanly under `-D warnings` (no unused bindings) and their assertions hold when run.
 
 ## [0.1.4] - 2026-06-05
 
