@@ -12,3 +12,4 @@ core.*
 *.profdata
 *.profraw
 /audit/
+/.claude/
