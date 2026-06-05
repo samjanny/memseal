@@ -7,6 +7,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-05
+
+### Changed
+
+* Reworded the package `description` to be more conservative and aligned with the README: "A small password-based encrypted vault for named secrets".
+* Added `authors` and `documentation` fields to `Cargo.toml`.
+
+### Documentation
+
+* Made the README code examples self-contained and runnable: wrapped the file-persistence, API-summary, and plaintext-handling snippets in `fn main() -> Result<(), VaultError>` blocks, removed the hidden rustdoc `# Ok::<...>` lines, and defined previously undefined `password`/`bytes` bindings in the API summary.
+
 ## [0.1.4] - 2026-06-05
 
 ### Security
@@ -91,7 +102,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/samjanny/memseal/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/samjanny/memseal/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/samjanny/memseal/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/samjanny/memseal/compare/v0.1.1...v0.1.2
