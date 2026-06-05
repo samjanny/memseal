@@ -166,7 +166,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Nonce reuse** | Nonces are derived deterministically via HKDF-SHA256 from monotonic counters. The index stream uses its own counter; entry data and entry name nonces use the entry `data_counter` with disjoint HKDF `info` prefixes for domain separation. Counter overflow at `u64::MAX` is a hard error. The index nonce is rotated on every `export()`. |
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
-| **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, and entry data size are bounded before processing. |
+| **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, entry data size, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap. |
 | **Swap exposure of ciphertext buffers** | Internal ciphertext buffers in `SecureMemoryVault` are locked with `mlock` via `memsec` where supported. |
 
 ### Out of scope / limitations
