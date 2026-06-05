@@ -1,12 +1,14 @@
 [package]
 name = "memseal"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "MIT"
-description = "Encrypt and store secrets in memory with password-based key derivation, authenticated encryption, and automatic zeroization"
+description = "A small password-based encrypted vault for named secrets"
+authors = ["Raffaele Mangiacasale <samjanny@gmail.com>"]
 keywords = ["encryption", "secrets", "vault", "memory", "security"]
 categories = ["cryptography"]
 repository = "https://github.com/samjanny/memseal"
+documentation = "https://docs.rs/memseal"
 readme = "README.md"
 
 [lib]

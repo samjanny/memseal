@@ -43,20 +43,23 @@ assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
 ## File Persistence
 
 ```rust
-use memseal::Vault;
+use memseal::{Vault, VaultError};
 use std::path::Path;
 
-let mut vault = Vault::create(b"my-password-here")?;
+fn main() -> Result<(), VaultError> {
+    let mut vault = Vault::create(b"my-password-here")?;
 
-vault.store("api_key", b"sk-secret-12345")?;
+    vault.store("api_key", b"sk-secret-12345")?;
 
-// Save to disk
-vault.save(Path::new("secrets.seal"))?;
+    // Save to disk
+    vault.save(Path::new("secrets.seal"))?;
 
-// Later: load and retrieve
-let vault = Vault::load(Path::new("secrets.seal"), b"my-password-here")?;
-let api_key = vault.retrieve("api_key")?;
-# Ok::<(), memseal::VaultError>(())
+    // Later: load and retrieve
+    let vault = Vault::load(Path::new("secrets.seal"), b"my-password-here")?;
+    let api_key = vault.retrieve("api_key")?;
+
+    Ok(())
+}
 ```
 
 ## API
@@ -65,24 +68,31 @@ let api_key = vault.retrieve("api_key")?;
 use memseal::{Vault, VaultError};
 use std::path::Path;
 
-// Create & open
-let mut vault = Vault::create(password)?;
-let vault = Vault::open(password, &bytes)?;
+fn main() -> Result<(), VaultError> {
+    let password = b"my-password-here";
 
-// File I/O
-vault.save(Path::new("vault.seal"))?;
-let vault = Vault::load(Path::new("vault.seal"), password)?;
+    // Create
+    let mut vault = Vault::create(password)?;
 
-// Store, retrieve, remove
-vault.store("name", b"secret")?;
-let data = vault.retrieve("name")?;  // Option<Vec<u8>>
-let existed = vault.remove("name")?; // bool
+    // Store, retrieve, remove
+    vault.store("name", b"secret")?;
+    let data = vault.retrieve("name")?;  // Option<Vec<u8>>
+    let existed = vault.remove("name")?; // bool
 
-// Export to bytes
-let bytes = vault.export()?;
+    // Export to bytes, then reopen
+    let bytes = vault.export()?;
+    let vault = Vault::open(password, &bytes)?;
 
-// Change password
-vault.change_password(b"old-password", b"new-password")?;
+    // File I/O
+    let mut vault = Vault::create(password)?;
+    vault.save(Path::new("vault.seal"))?;
+    let mut vault = Vault::load(Path::new("vault.seal"), password)?;
+
+    // Change password
+    vault.change_password(password, b"new-password-here")?;
+
+    Ok(())
+}
 ```
 
 ### Limits
@@ -113,15 +123,22 @@ Internal temporary plaintext and key material are zeroized where possible, but r
 If the caller wants drop-time zeroization, the returned `Vec<u8>` can be wrapped by the caller using `zeroize::Zeroizing`:
 
 ```rust
+use memseal::{Vault, VaultError};
 use zeroize::Zeroizing;
 
-if let Some(secret) = vault.retrieve("api_key")? {
-    let secret = Zeroizing::new(secret);
+fn main() -> Result<(), VaultError> {
+    let mut vault = Vault::create(b"my-password-here")?;
+    vault.store("api_key", b"sk-secret-12345")?;
 
-    // Use secret here.
-    // This allocation will be zeroized when `secret` is dropped.
+    if let Some(secret) = vault.retrieve("api_key")? {
+        let secret = Zeroizing::new(secret);
+
+        // Use secret here.
+        // This allocation will be zeroized when `secret` is dropped.
+    }
+
+    Ok(())
 }
-# Ok::<(), memseal::VaultError>(())
 ```
 
 This only zeroizes that returned allocation on drop. It does not prevent accidental copies made by caller code or by the allocator/runtime.
