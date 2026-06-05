@@ -57,6 +57,7 @@ fn main() -> Result<(), VaultError> {
     // Later: load and retrieve
     let vault = Vault::load(Path::new("secrets.seal"), b"my-password-here")?;
     let api_key = vault.retrieve("api_key")?;
+    assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
 
     Ok(())
 }
@@ -77,19 +78,22 @@ fn main() -> Result<(), VaultError> {
     // Store, retrieve, remove
     vault.store("name", b"secret")?;
     let data = vault.retrieve("name")?;  // Option<Vec<u8>>
+    assert_eq!(data, Some(b"secret".to_vec()));
     let existed = vault.remove("name")?; // bool
-
-    // Export to bytes, then reopen
-    let bytes = vault.export()?;
-    let vault = Vault::open(password, &bytes)?;
-
-    // File I/O
-    let mut vault = Vault::create(password)?;
-    vault.save(Path::new("vault.seal"))?;
-    let mut vault = Vault::load(Path::new("vault.seal"), password)?;
+    assert!(existed);
 
     // Change password
     vault.change_password(password, b"new-password-here")?;
+
+    // Export to bytes, then reopen with the new password
+    let bytes = vault.export()?;
+    let reopened = Vault::open(b"new-password-here", &bytes)?;
+    assert_eq!(reopened.retrieve("name")?, None);
+
+    // File I/O
+    vault.save(Path::new("vault.seal"))?;
+    let loaded = Vault::load(Path::new("vault.seal"), b"new-password-here")?;
+    let _ = loaded;
 
     Ok(())
 }
@@ -134,6 +138,8 @@ fn main() -> Result<(), VaultError> {
         let secret = Zeroizing::new(secret);
 
         // Use secret here.
+        assert_eq!(secret.as_slice(), b"sk-secret-12345");
+
         // This allocation will be zeroized when `secret` is dropped.
     }
 
