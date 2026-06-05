@@ -207,10 +207,14 @@ prevents leaking entry names through the serialized vault. Entry name
 lookup at runtime always re-derives the HMAC of the plaintext name with
 the in-memory `hmac_key` before consulting the map.
 
-`MAX_INDEX_ENTRIES = 1024` is enforced on `insert_file`. The decoded
-JSON does not enforce this cap on `open()`, but the file-size and
-ciphertext-size bounds upstream make it impractical to embed many more
-than this in a single 256 MiB file.
+`MAX_INDEX_ENTRIES = 1024` is enforced on `insert_file` and again on
+`open()`: after the index JSON is decrypted and parsed, an index whose
+`files` map holds more than `MAX_INDEX_ENTRIES` entries is rejected with
+`VaultError::CorruptedData` before the in-memory `VaultIndex` is built.
+The file-size and ciphertext-size bounds upstream already make it
+impractical to embed many more than this in a single 256 MiB file; the
+explicit cap on `open()` closes the gap so a crafted index cannot force a
+larger map than the format allows.
 
 
 ## 8. Per-entry encryption
@@ -277,7 +281,7 @@ All inputs that affect parsing memory or CPU are bounded before use:
 | index `version`           | in `SUPPORTED_VAULT_INDEX_VERSIONS` | `Vault::open` step 8  |
 | entry name length         | `<= MAX_ENTRY_NAME_LEN (255)`| `Vault::store`               |
 | entry data size           | `<= MAX_ENTRY_DATA_SIZE (64 MiB)` | `Vault::store`          |
-| index entry count         | `<= MAX_INDEX_ENTRIES (1024)`| `VaultIndex::insert_file`    |
+| index entry count         | `<= MAX_INDEX_ENTRIES (1024)`| `VaultIndex::insert_file`, `Vault::open` |
 | password length           | `>= MIN_PASSWORD_LEN (8)`    | `Vault::create`              |
 
 

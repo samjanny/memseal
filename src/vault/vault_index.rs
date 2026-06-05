@@ -289,6 +289,23 @@ impl VaultIndex<NonceNotRotated> {
         data_nonce_counter: u64,
         files: HashMap<String, IndexMetaBlockMetadata>,
     ) -> Result<Self, IndexError> {
+        // Data nonces are derived from (enc_key, data_counter); with enc_key
+        // fixed for the vault's lifetime, nonce uniqueness depends entirely on
+        // data_nonce_counter never reissuing a counter already used by an
+        // entry. A vault produced by this library always advances the counter
+        // past every stored entry, so on reopen data_nonce_counter must be
+        // strictly greater than the largest stored data_counter. A violation
+        // means the (authenticated) index is inconsistent; reject it rather
+        // than risk a future store() reusing a (enc_key, data_counter) pair.
+        if let Some(max_counter) = files.values().map(|m| m.data_counter).max()
+            && data_nonce_counter <= max_counter
+        {
+            return Err(IndexError::GenericError(format!(
+                "data_nonce_counter ({}) must exceed the largest stored data_counter ({})",
+                data_nonce_counter, max_counter
+            )));
+        }
+
         let (mut enc_sub, mut hmac_sub) = derive_subkeys(master_key, salt)?;
 
         let enc_vault = SecureMemoryVault::new(&enc_sub)
@@ -694,5 +711,82 @@ mod tests {
         let mut idx = VaultIndex::generate().unwrap();
         idx.data_nonce_counter = u64::MAX;
         assert!(idx.next_data_nonce_counter().is_err());
+    }
+
+    fn meta_with_counter(counter: u64) -> IndexMetaBlockMetadata {
+        IndexMetaBlockMetadata::new(
+            IndexMetaBlockLocation::Inline,
+            0,
+            0,
+            false,
+            None,
+            None,
+            counter,
+        )
+    }
+
+    #[test]
+    fn from_master_key_and_data_rejects_counter_not_ahead_of_entries() {
+        // data_nonce_counter must be strictly greater than the largest stored
+        // data_counter, otherwise a later store() could reuse a nonce.
+        let master = [0x11u8; 32];
+        let salt = [0x22u8; 16];
+        let mut files = HashMap::new();
+        files.insert("a".to_string(), meta_with_counter(5));
+
+        // Equal to the max stored counter: must be rejected.
+        let result = VaultIndex::from_master_key_and_data(
+            &master,
+            &salt,
+            [0u8; XCHACHA20_NONCE_LEN],
+            0,
+            5,
+            files.clone(),
+        );
+        assert!(result.is_err());
+
+        // Below the max stored counter: must be rejected.
+        let result = VaultIndex::from_master_key_and_data(
+            &master,
+            &salt,
+            [0u8; XCHACHA20_NONCE_LEN],
+            0,
+            3,
+            files,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_master_key_and_data_accepts_counter_ahead_of_entries() {
+        let master = [0x11u8; 32];
+        let salt = [0x22u8; 16];
+        let mut files = HashMap::new();
+        files.insert("a".to_string(), meta_with_counter(5));
+
+        let result = VaultIndex::from_master_key_and_data(
+            &master,
+            &salt,
+            [0u8; XCHACHA20_NONCE_LEN],
+            0,
+            6,
+            files,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn from_master_key_and_data_accepts_empty_files_with_zero_counter() {
+        let master = [0x11u8; 32];
+        let salt = [0x22u8; 16];
+        let result = VaultIndex::from_master_key_and_data(
+            &master,
+            &salt,
+            [0u8; XCHACHA20_NONCE_LEN],
+            0,
+            0,
+            HashMap::new(),
+        );
+        assert!(result.is_ok());
     }
 }
