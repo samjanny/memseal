@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-06-12
+
 ### Security
 
 * All XChaCha20 nonces (index nonce per `export()`, entry data and name nonces per `store()`) are now generated randomly from the OS CSPRNG instead of being derived via HKDF from monotonic counters. Counter-derived nonces could repeat if the same persisted vault state was opened by two `Vault` instances and both exported ("state fork"), reusing a (key, nonce) pair across the two outputs. Random 192-bit nonces make this impossible. Existing vault files remain fully readable: nonces were always stored in the file and as the prefix of each entry ciphertext, and reading never re-derives them. The counters are retained as authenticated state, stay bound into the per-entry AAD, and are still checked for monotonic consistency on `open()`.
@@ -119,7 +121,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/samjanny/memseal/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/samjanny/memseal/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/samjanny/memseal/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/samjanny/memseal/compare/v0.1.2...v0.1.3
