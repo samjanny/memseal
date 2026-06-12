@@ -109,6 +109,13 @@ fn main() -> Result<(), VaultError> {
 | Vault file | Maximum 256 MiB |
 | Index entries | Maximum 1024 |
 
+The 256 MiB file bound is enforced on both sides: `load()` refuses larger
+files and `export()`/`save()` refuse to produce them. Encrypted entry
+bytes are stored in the index JSON as number arrays (roughly 3.6 output
+bytes per stored byte), so the practical bound on total stored plaintext
+across all entries is about 70 MiB; `export()` fails cleanly when it is
+exceeded and the vault stays usable. See `DESIGN.md` section 9.3.
+
 ## Handling Plaintext
 
 `retrieve()` returns decrypted data as `Option<Vec<u8>>`.
@@ -186,7 +193,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Entry swap attacks** | Each entry's data and name ciphertexts share an AAD made of the entry's HMAC-derived key and its `data_counter`. Swapping either the encrypted data or the encrypted name across entries causes AEAD verification to fail. |
 | **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
 | **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: out-of-range values (for example, below-minimum memory cost or zero iterations) are rejected by `validate_header()` during `open()`, blocking forged headers that would make password guessing artificially cheap. |
-| **Nonce reuse** | Nonces are derived deterministically via HKDF-SHA256 from monotonic counters. The index stream uses its own counter; entry data and entry name nonces use the entry `data_counter` with disjoint HKDF `info` prefixes for domain separation. Counter overflow at `u64::MAX` is a hard error. The index nonce is rotated on every `export()`. |
+| **Nonce reuse** | All XChaCha20 nonces are 24-byte values drawn from the OS CSPRNG and stored next to the ciphertext they protect: a fresh index nonce on every `export()`, fresh entry data/name nonces on every `store()`. Random generation also covers state forks: two vault instances opened from the same persisted bytes cannot repeat a nonce when both export, which counter-derived nonces would. Monotonic counters remain as authenticated state, are bound into entry AAD, and overflow at `u64::MAX` is a hard error. |
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
 | **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, entry data size, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap. |
@@ -228,12 +235,12 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
         +--> XChaCha20-Poly1305 encryption
 
 Per-entry encryption:
-  nonce = HKDF(enc_subkey, counter, domain)
+  nonce = random 24 bytes (OsRng), stored as the ciphertext prefix
   aad   = hex(HMAC-SHA256(hmac_subkey, plaintext_name)) || data_counter (u64 LE)
   ct    = XChaCha20-Poly1305(enc_subkey, nonce, plaintext, aad)
 
 Index encryption:
-  index nonce rotates on every export
+  fresh random index nonce on every export, stored in the file
   vault header is authenticated as AAD
 ```
 
@@ -244,10 +251,10 @@ Note: `mlock` is applied only to internal ciphertext buffers inside `SecureMemor
 | Primitive | Implementation | Purpose |
 |-----------|----------------|---------|
 | Argon2i | `orion` | Password-based key derivation |
-| HKDF-SHA256 | `orion` | Subkey derivation and nonce derivation |
+| HKDF-SHA256 | `orion` | Subkey derivation |
 | XChaCha20-Poly1305 | `orion` | Authenticated encryption |
 | HMAC-SHA256 | `orion` | Entry-name hashing |
-| OsRng | `rand_core` | Random salt generation |
+| OsRng | `rand_core` | Random salt and nonce generation |
 | `mlock` / `munlock` | `memsec` | Best-effort locking of internal ciphertext buffers |
 | Zeroization | `zeroize` | Clearing internal temporary secrets where possible |
 
@@ -255,7 +262,7 @@ Note: `mlock` is applied only to internal ciphertext buffers inside `SecureMemor
 
 - **Small public API.** The crate exposes `Vault` and `VaultError`; internal modules are private.
 - **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for `mlock`/`munlock` and `unsafe impl Send/Sync`.
-- **Domain separation.** Key derivation and nonce derivation use distinct domain labels.
+- **Domain separation.** Subkey derivation uses distinct HKDF `info` labels for the encryption and HMAC keys.
 - **Authenticated encryption.** Vault index data and entries are encrypted with AEAD.
 - **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing.
 - **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix.

@@ -18,7 +18,16 @@ pub fn secure_usize_between(min: usize, max: usize) -> Result<usize, &'static st
         return Err("Invalid range: min must be less than max");
     }
 
-    let range = max - min + 1;
+    // Use wrapping arithmetic so the full range [0, usize::MAX] does not overflow
+    let range = max.wrapping_sub(min).wrapping_add(1);
+
+    if range == 0 {
+        // Full usize range - any value is valid, no rejection needed
+        let val = OsRng
+            .try_next_u64()
+            .map_err(|_| "Failed to generate random number")?;
+        return Ok(val as usize);
+    }
 
     // Calculate the maximum limit to avoid bias
     let limit = usize::MAX - (usize::MAX % range);
@@ -56,7 +65,16 @@ pub fn secure_u32_between(min: u32, max: u32) -> Result<u32, &'static str> {
         return Err("Invalid range: min must be less than max");
     }
 
-    let range = max - min + 1;
+    // Use wrapping arithmetic so the full range [0, u32::MAX] does not overflow
+    let range = max.wrapping_sub(min).wrapping_add(1);
+
+    if range == 0 {
+        // Full u32 range - any value is valid, no rejection needed
+        let val = OsRng
+            .try_next_u32()
+            .map_err(|_| "Failed to generate random number")?;
+        return Ok(val);
+    }
 
     // Calculate the maximum limit to avoid bias
     let limit = u32::MAX - (u32::MAX % range);
@@ -94,7 +112,16 @@ pub fn secure_u64_between(min: u64, max: u64) -> Result<u64, &'static str> {
         return Err("Invalid range: min must be less than max");
     }
 
-    let range = max - min + 1;
+    // Use wrapping arithmetic so the full range [0, u64::MAX] does not overflow
+    let range = max.wrapping_sub(min).wrapping_add(1);
+
+    if range == 0 {
+        // Full u64 range - any value is valid, no rejection needed
+        let val = OsRng
+            .try_next_u64()
+            .map_err(|_| "Failed to generate random number")?;
+        return Ok(val);
+    }
 
     // Calculate the maximum limit to avoid bias
     let limit = u64::MAX - (u64::MAX % range);
@@ -136,7 +163,7 @@ pub fn secure_i32_between(min: i32, max: i32) -> Result<i32, &'static str> {
     let range = (max as u32).wrapping_sub(min as u32).wrapping_add(1);
 
     if range == 0 {
-        // Full u32 range — any value is valid, no rejection needed
+        // Full u32 range - any value is valid, no rejection needed
         let val = OsRng
             .try_next_u32()
             .map_err(|_| "Failed to generate random number")?;
@@ -287,6 +314,32 @@ mod tests {
     fn secure_i64_between_returns_error_for_invalid_range() {
         let result = secure_i64_between(1_000, -1_000);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn secure_usize_between_handles_full_range() {
+        // Previously overflowed range computation and panicked on modulo zero.
+        assert!(secure_usize_between(0, usize::MAX).is_ok());
+    }
+
+    #[test]
+    fn secure_u32_between_handles_full_range() {
+        assert!(secure_u32_between(0, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn secure_u64_between_handles_full_range() {
+        assert!(secure_u64_between(0, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn secure_i32_between_handles_full_range() {
+        assert!(secure_i32_between(i32::MIN, i32::MAX).is_ok());
+    }
+
+    #[test]
+    fn secure_i64_between_handles_full_range() {
+        assert!(secure_i64_between(i64::MIN, i64::MAX).is_ok());
     }
 
     #[test]

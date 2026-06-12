@@ -22,12 +22,6 @@ pub mod xchacha20_poly1305 {
 
 pub const SECURE_MEMORY_VAULT_CHUNK_SIZE: usize = 4 * 1024; // 4 KiB
 
-pub mod nonce_derivation {
-    pub const NONCE_HKDF_INFO_PREFIX: &[u8] = b"MEMSEAL_NONCE_CTR_v1";
-    pub const DATA_NONCE_HKDF_INFO_PREFIX: &[u8] = b"MEMSEAL_DATA_NONCE_v1";
-    pub const NAME_NONCE_HKDF_INFO_PREFIX: &[u8] = b"MEMSEAL_NAME_NONCE_v1";
-}
-
 pub const MIN_KDF_MEMORY: u32 = 8; // orion Argon2i minimum: 8 * LANES KiB
 pub const MIN_KDF_ITERATIONS: u32 = 1;
 pub const MIN_PASSWORD_LEN: usize = 8;

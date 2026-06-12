@@ -5,7 +5,7 @@ use crate::constants::vault_index_constants::{
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::crypto::encdec_trait::{EncryptionError, SecureAccess, SecureConstructor};
 use crate::crypto::nonce_rotation::{
-    NonceNotRotated, NonceRotated, NonceRotation, NonceRotationError, derive_nonce_from_counter,
+    NonceNotRotated, NonceRotated, NonceRotation, NonceRotationError,
 };
 use crate::crypto::utils::secure_bytes_fill;
 use crate::mem::secure_memory_vault::SecureMemoryVault;
@@ -59,8 +59,10 @@ pub struct IndexMetaBlockMetadata {
 
 /// Encrypted index mapping HMAC'd entry names to their metadata.
 ///
-/// Uses a type-state parameter `N` (`NonceNotRotated` or `NonceRotated`)
-/// to enforce nonce rotation at compile time.
+/// Carries a type-state parameter `N` (`NonceNotRotated` or `NonceRotated`)
+/// for callers that consume the index through `rotate_nonce()`. The `Vault`
+/// facade does not use the type-state path; it advances nonces imperatively
+/// via `advance_nonce()` before each export.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VaultIndex<N> {
     pub version: u16,
@@ -105,13 +107,14 @@ impl<N> VaultIndex<N> {
         &self.kdf_salt
     }
 
-    /// Increments the nonce counter and derives a fresh nonce. Must be called before each export.
+    /// Increments the nonce counter and generates a fresh random nonce.
+    /// Must be called before each export.
+    ///
+    /// The nonce is drawn from the OS CSPRNG rather than derived from the
+    /// counter, so two vault instances opened from the same persisted state
+    /// cannot reuse a nonce when both export. The counter is kept as
+    /// authenticated, monotonic state.
     pub fn advance_nonce(&mut self) -> Result<(), IndexError> {
-        let enc_vault = self
-            .enc_key
-            .as_ref()
-            .ok_or(IndexError::GenericError("Key not available".to_string()))?;
-
         self.nonce_counter = self
             .nonce_counter
             .checked_add(1)
@@ -119,17 +122,8 @@ impl<N> VaultIndex<N> {
                 "Nonce counter overflow".to_string(),
             ))?;
 
-        let counter = self.nonce_counter;
-        let salt = self.kdf_salt.clone();
         let mut new_nonce = [0u8; XCHACHA20_NONCE_LEN];
-        enc_vault
-            .access(|enc_chunk, _tag| {
-                new_nonce = derive_nonce_from_counter(enc_chunk, counter, &salt).map_err(|e| {
-                    crate::mem::secure_memory_vault::MemoryVaultError::GenericError(e.to_string())
-                })?;
-                Ok(())
-            })
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
+        secure_bytes_fill(&mut new_nonce).map_err(|e| IndexError::NonceError(e.to_string()))?;
 
         self.nonce = new_nonce;
         Ok(())
@@ -186,13 +180,15 @@ impl<N> VaultIndex<N> {
         plaintext_name: &str,
         metadata: IndexMetaBlockMetadata,
     ) -> Result<(), IndexError> {
-        if self.files.len() >= MAX_INDEX_ENTRIES {
+        let hashed_key = self.hmac_filename(plaintext_name)?;
+        // The cap applies to the map size; overwriting an existing entry does
+        // not grow the map and stays allowed at the cap.
+        if self.files.len() >= MAX_INDEX_ENTRIES && !self.files.contains_key(&hashed_key) {
             return Err(IndexError::GenericError(format!(
                 "Maximum index entries ({}) reached",
                 MAX_INDEX_ENTRIES
             )));
         }
-        let hashed_key = self.hmac_filename(plaintext_name)?;
         if let Some(mut old) = self.files.insert(hashed_key, metadata) {
             if let Some(ref mut data) = old.encrypted_data {
                 data.zeroize();
@@ -257,8 +253,8 @@ impl VaultIndex<NonceNotRotated> {
         let (mut enc_sub, mut hmac_sub) = derive_subkeys(master_key, salt)?;
 
         let initial_counter: u64 = 0;
-        let nonce = derive_nonce_from_counter(&enc_sub, initial_counter, salt)
-            .map_err(|e| IndexError::NonceError(e.to_string()))?;
+        let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut nonce).map_err(|e| IndexError::NonceError(e.to_string()))?;
 
         let enc_vault = SecureMemoryVault::new(&enc_sub)
             .map_err(|e| IndexError::GenericError(e.to_string()))?;
@@ -339,7 +335,6 @@ impl VaultIndex<NonceNotRotated> {
 
         let mut enc_sub = [0u8; SUBKEY_LEN];
         let mut hmac_sub = [0u8; SUBKEY_LEN];
-        let mut initial_nonce = [0u8; XCHACHA20_NONCE_LEN];
         let initial_counter: u64 = 0;
 
         master_vault
@@ -349,15 +344,12 @@ impl VaultIndex<NonceNotRotated> {
                 })?;
                 enc_sub = e;
                 hmac_sub = h;
-                initial_nonce =
-                    derive_nonce_from_counter(&enc_sub, initial_counter, &[]).map_err(|e| {
-                        crate::mem::secure_memory_vault::MemoryVaultError::GenericError(
-                            e.to_string(),
-                        )
-                    })?;
                 Ok(())
             })
             .map_err(|e| IndexError::GenericError(e.to_string()))?;
+
+        let mut initial_nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut initial_nonce).map_err(|e| IndexError::NonceError(e.to_string()))?;
 
         let enc_vault = SecureMemoryVault::new(&enc_sub)
             .map_err(|e| IndexError::GenericError(e.to_string()))?;
@@ -426,29 +418,13 @@ impl IndexMetaBlockMetadata {
 impl NonceRotation for VaultIndex<NonceNotRotated> {
     type Output = VaultIndex<NonceRotated>;
     fn rotate_nonce(self) -> Result<Self::Output, NonceRotationError> {
-        let enc_vault = self
-            .enc_key
-            .as_ref()
-            .ok_or(NonceRotationError::KeyNotAvailable)?;
-
         let new_counter = self
             .nonce_counter
             .checked_add(1)
             .ok_or(NonceRotationError::CounterOverflow)?;
 
-        let salt = self.kdf_salt.clone();
         let mut new_nonce = [0u8; XCHACHA20_NONCE_LEN];
-        enc_vault
-            .access(|enc_chunk, _tag| {
-                new_nonce =
-                    derive_nonce_from_counter(enc_chunk, new_counter, &salt).map_err(|e| {
-                        crate::mem::secure_memory_vault::MemoryVaultError::GenericError(
-                            e.to_string(),
-                        )
-                    })?;
-                Ok(())
-            })
-            .map_err(|_| NonceRotationError::NonceRotationFailed)?;
+        secure_bytes_fill(&mut new_nonce).map_err(|_| NonceRotationError::NonceRotationFailed)?;
 
         Ok(VaultIndex {
             version: self.version,
@@ -476,8 +452,8 @@ impl SecureConstructor for VaultIndex<NonceNotRotated> {
             .map_err(|e| EncryptionError::GenericError(e.to_string()))?;
 
         let initial_counter: u64 = 0;
-        let nonce = derive_nonce_from_counter(&enc_sub, initial_counter, &[])
-            .map_err(|e| EncryptionError::GenericError(e.to_string()))?;
+        let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut nonce).map_err(|e| EncryptionError::GenericError(e.to_string()))?;
 
         let enc_vault = SecureMemoryVault::new(&enc_sub)
             .map_err(|e| EncryptionError::GenericError(e.to_string()))?;
@@ -541,12 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn from_master_key_is_deterministic() {
+    fn from_master_key_uses_random_initial_nonce() {
+        // Nonces are drawn from the OS CSPRNG, so two indexes built from the
+        // same master key and salt must not share an initial nonce.
         let master = [0x42u8; 32];
         let salt = [0xAA; 16];
         let idx1 = VaultIndex::from_master_key(&master, &salt).unwrap();
         let idx2 = VaultIndex::from_master_key(&master, &salt).unwrap();
-        assert_eq!(idx1.nonce, idx2.nonce);
+        assert_ne!(idx1.nonce, idx2.nonce);
     }
 
     #[test]
@@ -692,11 +670,33 @@ mod tests {
     }
 
     #[test]
-    fn nonce_derivation_is_deterministic() {
-        let key = [0x55u8; 32];
-        let n1 = derive_nonce_from_counter(&key, 7, &[]).unwrap();
-        let n2 = derive_nonce_from_counter(&key, 7, &[]).unwrap();
-        assert_eq!(n1, n2);
+    fn advance_nonce_produces_unique_nonces() {
+        let mut idx = VaultIndex::generate().unwrap();
+        idx.advance_nonce().unwrap();
+        let first = idx.nonce;
+        idx.advance_nonce().unwrap();
+        assert_ne!(idx.nonce, first);
+        assert_eq!(idx.nonce_counter, 2);
+    }
+
+    #[test]
+    fn insert_file_at_cap_allows_overwrite_but_rejects_new_entry() {
+        let mut idx = VaultIndex::generate().unwrap();
+        for i in 0..MAX_INDEX_ENTRIES {
+            idx.insert_file(&format!("entry-{}", i), meta_with_counter(0))
+                .unwrap();
+        }
+        assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
+
+        // Overwriting an existing name does not grow the map: must succeed.
+        idx.insert_file("entry-0", meta_with_counter(1)).unwrap();
+        assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
+
+        // A new name would exceed the cap: must fail.
+        assert!(
+            idx.insert_file("one-too-many", meta_with_counter(2))
+                .is_err()
+        );
     }
 
     #[test]

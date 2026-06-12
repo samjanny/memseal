@@ -7,6 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+* All XChaCha20 nonces (index nonce per `export()`, entry data and name nonces per `store()`) are now generated randomly from the OS CSPRNG instead of being derived via HKDF from monotonic counters. Counter-derived nonces could repeat if the same persisted vault state was opened by two `Vault` instances and both exported ("state fork"), reusing a (key, nonce) pair across the two outputs. Random 192-bit nonces make this impossible. Existing vault files remain fully readable: nonces were always stored in the file and as the prefix of each entry ciphertext, and reading never re-derives them. The counters are retained as authenticated state, stay bound into the per-entry AAD, and are still checked for monotonic consistency on `open()`.
+* `change_password` no longer silently skips a non-dummy entry whose `encrypted_name` or `encrypted_data` is missing or undersized; it now fails with `CorruptedData`, leaving the original vault intact. Entries flagged `is_dummy` are skipped explicitly. Vaults produced by this library always populate both fields, so the behavior change is only observable on inconsistent (but authenticated) indexes.
+
+### Fixed
+
+* `export()` now rejects outputs larger than the 256 MiB bound that `load()` enforces, returning `SerializationError` and leaving the vault usable. Previously `save()` could write a vault that `load()` would then refuse to read: encrypted entry bytes serialize into the index JSON as number arrays at roughly 3.6 output bytes per stored byte, so about 71 MiB of aggregate plaintext was enough to cross the cap. The practical aggregate bound is now documented in the README and in `DESIGN.md` section 9.3, and a denser index encoding is scheduled for `0.2.x`.
+* `insert_file` no longer rejects overwriting an existing entry when the index is at `MAX_INDEX_ENTRIES`; the cap check now only applies to inserts that would grow the map. Previously a full vault could not update any of its own entries.
+* `save()` now removes the temporary file if writing or syncing it fails, instead of leaving it behind in the target directory.
+* The unsigned `secure_usize_between`, `secure_u32_between`, and `secure_u64_between` helpers no longer overflow (and panic on a modulo by zero) when called with the full integer range; they now match the full-range handling that the signed variants already had.
+
+### Documentation
+
+* Rewrote the nonce sections of `DESIGN.md` (sections 5, 5.1, 8) and the README threat model, architecture diagram, and primitives table to describe random nonce generation, the state-fork rationale, and backward compatibility with files written by earlier releases.
+* Documented the JSON number-array encoding of ciphertext bytes and the resulting ~70 MiB practical aggregate plaintext bound (`DESIGN.md` section 9.3, README limits section), and added a denser-encoding item to the `0.2.x` roadmap.
+
 ## [0.1.5] - 2026-06-05
 
 ### Changed

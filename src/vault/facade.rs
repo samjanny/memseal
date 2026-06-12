@@ -22,9 +22,6 @@
 //! ```
 
 use crate::constants::argon2::KEY_LEN;
-use crate::constants::nonce_derivation::{
-    DATA_NONCE_HKDF_INFO_PREFIX, NAME_NONCE_HKDF_INFO_PREFIX,
-};
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::constants::{
     MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, MIN_PASSWORD_LEN,
@@ -38,7 +35,7 @@ use crate::vault::vault_header::VaultHeader;
 use crate::vault::vault_index::{
     IndexMetaBlockLocation, IndexMetaBlockMetadata, VaultIndex, derive_subkeys,
 };
-use orion::hazardous::kdf::{argon2i, hkdf};
+use orion::hazardous::kdf::argon2i;
 use std::io::Read as IoRead;
 use std::path::Path;
 use zeroize::Zeroize;
@@ -247,25 +244,14 @@ impl Vault {
             .next_data_nonce_counter()
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
 
-        let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-
-        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
-
-        let salt = self.index.kdf_salt().to_vec();
-        let data_nonce = derive_nonce_with_prefix(
-            &enc_key_bytes,
-            data_counter,
-            DATA_NONCE_HKDF_INFO_PREFIX,
-            &salt,
-        )
-        .inspect_err(|_| enc_key_bytes.zeroize())?;
-        let name_nonce = derive_nonce_with_prefix(
-            &enc_key_bytes,
-            data_counter,
-            NAME_NONCE_HKDF_INFO_PREFIX,
-            &salt,
-        )
-        .inspect_err(|_| enc_key_bytes.zeroize())?;
+        // Random nonces from the OS CSPRNG. They are stored as the prefix of
+        // each ciphertext, so they never need to be re-derived; randomness
+        // also rules out reuse when two vault instances are opened from the
+        // same persisted state.
+        let mut data_nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut data_nonce).map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let mut name_nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut name_nonce).map_err(|e| VaultError::CryptoError(e.to_string()))?;
 
         // Compute HMAC'd key for AAD binding (prevents entry-swap attacks)
         let hmac_key = self
@@ -273,6 +259,9 @@ impl Vault {
             .lookup_hmac_key_for_name(name)
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
         let entry_aad = build_entry_aad(&hmac_key, data_counter);
+
+        let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
 
         let result = (|| -> Result<(), VaultError> {
             let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)
@@ -379,7 +368,16 @@ impl Vault {
 
     /// Serializes the vault to bytes for persistence.
     ///
-    /// Each call rotates the index nonce to prevent nonce reuse.
+    /// Each call generates a fresh random index nonce and advances the
+    /// authenticated nonce counter.
+    ///
+    /// Returns [`VaultError::SerializationError`] if the serialized vault
+    /// exceeds the 256 MiB file-size bound enforced by [`Vault::load`]; this
+    /// guarantees that anything `export()` produces can be loaded back.
+    /// Encrypted entry bytes are stored in the index JSON as number arrays
+    /// (roughly 3.6 output bytes per stored byte), so the practical bound on
+    /// total stored plaintext is about 70 MiB. The vault itself is left
+    /// intact by this error; remove entries and export again.
     pub fn export(&mut self) -> Result<Vec<u8>, VaultError> {
         self.index
             .advance_nonce()
@@ -420,6 +418,8 @@ impl Vault {
         output.extend_from_slice(&self.index.nonce_counter.to_le_bytes());
         output.extend_from_slice(&encrypted_index);
 
+        validate_export_size(output.len() as u64)?;
+
         Ok(output)
     }
 
@@ -450,9 +450,12 @@ impl Vault {
             opts.open(&tmp_path)?
         };
 
-        file.write_all(&data)?;
-        file.sync_all()?;
+        let write_result = file.write_all(&data).and_then(|_| file.sync_all());
         drop(file);
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
 
         std::fs::rename(&tmp_path, path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp_path);
@@ -490,7 +493,7 @@ impl Vault {
         let mut new_master_key = derive_master_key(new_password, &new_header)?;
 
         // Collect encrypted entries with HMAC'd keys and data_counter for AAD
-        type OldEntry = (String, u64, Option<Vec<u8>>, Option<Vec<u8>>);
+        type OldEntry = (String, u64, bool, Option<Vec<u8>>, Option<Vec<u8>>);
         let old_entries: Vec<OldEntry> = self
             .index
             .files
@@ -499,6 +502,7 @@ impl Vault {
                 (
                     k.clone(),
                     m.data_counter,
+                    m.is_dummy,
                     m.encrypted_name.clone(),
                     m.encrypted_data.clone(),
                 )
@@ -529,7 +533,16 @@ impl Vault {
 
         // Re-encrypt entries one at a time into new_vault
         let loop_result = (|| -> Result<(), VaultError> {
-            for (old_hmac_key, old_counter, enc_name_opt, enc_data_opt) in &old_entries {
+            for (old_hmac_key, old_counter, is_dummy, enc_name_opt, enc_data_opt) in &old_entries {
+                // Dummy padding entries carry no payload; they are dropped on
+                // password change rather than re-encrypted.
+                if *is_dummy {
+                    continue;
+                }
+
+                // A real entry always stores both ciphertexts; a missing or
+                // undersized field means the (authenticated) index is
+                // inconsistent. Fail instead of silently dropping the entry.
                 let old_aad = build_entry_aad(old_hmac_key, *old_counter);
 
                 let mut plaintext_name = match enc_name_opt {
@@ -539,18 +552,26 @@ impl Vault {
                         let ct = &enc_name[XCHACHA20_NONCE_LEN..];
                         let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)
                             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-                        String::from_utf8(name_bytes).map_err(|_| {
+                        String::from_utf8(name_bytes).map_err(|e| {
+                            let mut bytes = e.into_bytes();
+                            bytes.zeroize();
                             VaultError::CorruptedData("Invalid entry name".to_string())
                         })?
                     }
-                    _ => continue,
+                    _ => {
+                        return Err(VaultError::CorruptedData(
+                            "Entry is missing a valid encrypted name".to_string(),
+                        ));
+                    }
                 };
 
                 let encrypted = match enc_data_opt {
                     Some(enc) if enc.len() >= XCHACHA20_NONCE_LEN => enc,
                     _ => {
                         plaintext_name.zeroize();
-                        continue;
+                        return Err(VaultError::CorruptedData(
+                            "Entry is missing valid encrypted data".to_string(),
+                        ));
                     }
                 };
 
@@ -617,6 +638,18 @@ fn validate_header(header: &VaultHeader) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Rejects exports larger than the bound `Vault::load` enforces, so a vault
+/// that `save()` writes can always be loaded back.
+fn validate_export_size(len: u64) -> Result<(), VaultError> {
+    if len > MAX_VAULT_FILE_SIZE {
+        return Err(VaultError::SerializationError(format!(
+            "Exported vault is {} bytes, exceeding the maximum vault file size of {} bytes; remove entries before exporting",
+            len, MAX_VAULT_FILE_SIZE
+        )));
+    }
+    Ok(())
+}
+
 fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
     let key_bytes = hmac_key.as_bytes();
     let counter_bytes = counter.to_le_bytes();
@@ -672,23 +705,6 @@ fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_L
     )
     .map_err(|e| VaultError::CryptoError(format!("Argon2i derivation failed: {}", e)))?;
     Ok(master_key)
-}
-
-fn derive_nonce_with_prefix(
-    enc_key: &[u8],
-    counter: u64,
-    prefix: &[u8],
-    salt: &[u8],
-) -> Result<[u8; XCHACHA20_NONCE_LEN], VaultError> {
-    let counter_bytes = counter.to_le_bytes();
-    let mut info = Vec::with_capacity(prefix.len() + 8);
-    info.extend_from_slice(prefix);
-    info.extend_from_slice(&counter_bytes);
-
-    let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
-    hkdf::sha256::derive_key(salt, enc_key, Some(&info), &mut nonce)
-        .map_err(|e| VaultError::CryptoError(format!("Nonce derivation failed: {}", e)))?;
-    Ok(nonce)
 }
 
 #[cfg(test)]
@@ -1328,13 +1344,10 @@ mod tests {
             );
         }
 
-        let nonce = derive_nonce_with_prefix(
-            &enc_sub,
-            1,
-            crate::constants::nonce_derivation::NONCE_HKDF_INFO_PREFIX,
-            &header.kdf_salt,
-        )
-        .unwrap();
+        // Any unique nonce works: open() reads the nonce from the file and
+        // never re-derives it.
+        let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
+        secure_bytes_fill(&mut nonce).unwrap();
 
         // All forged entries use data_counter 0, so data_nonce_counter must be
         // at least 1 to satisfy the nonce-counter invariant enforced on open.
@@ -1380,5 +1393,114 @@ mod tests {
             Vault::open(password, &data),
             Err(VaultError::CorruptedData(_))
         ));
+    }
+
+    // Group F: export size bound and nonce freshness.
+
+    #[test]
+    fn export_size_validation_boundary() {
+        assert!(validate_export_size(MAX_VAULT_FILE_SIZE).is_ok());
+        assert!(matches!(
+            validate_export_size(MAX_VAULT_FILE_SIZE + 1),
+            Err(VaultError::SerializationError(_))
+        ));
+    }
+
+    /// Slowest test in the suite (tens of seconds in debug): it materializes
+    /// an export just above the 256 MiB cap to pin the guarantee end to end.
+    /// Encrypted bytes serialize into the index JSON as number arrays at
+    /// roughly 3.6 output bytes per stored byte, so 74 MiB of plaintext is
+    /// enough to cross the cap.
+    #[test]
+    fn export_rejects_vault_exceeding_max_file_size() {
+        fn pseudo_bytes(len: usize, seed: u64) -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i as u64 ^ seed).wrapping_mul(2654435761) >> 7) as u8)
+                .collect()
+        }
+
+        let mut vault = Vault::create(b"password-size-cap").unwrap();
+        vault
+            .store("a", &pseudo_bytes(37 * 1024 * 1024, 1))
+            .unwrap();
+        vault
+            .store("b", &pseudo_bytes(37 * 1024 * 1024, 2))
+            .unwrap();
+
+        assert!(matches!(
+            vault.export(),
+            Err(VaultError::SerializationError(_))
+        ));
+
+        // The vault stays intact and usable: dropping one entry brings the
+        // export back under the cap.
+        assert!(vault.remove("b").unwrap());
+        let exported = vault.export().unwrap();
+        assert!(exported.len() as u64 <= MAX_VAULT_FILE_SIZE);
+        let reopened = Vault::open(b"password-size-cap", &exported).unwrap();
+        assert!(reopened.retrieve("a").unwrap().is_some());
+    }
+
+    #[test]
+    fn storing_same_name_twice_uses_fresh_nonces() {
+        // Entry nonces are random per store(), never a function of the
+        // counter alone; re-storing a name must produce new nonce prefixes.
+        let mut vault = Vault::create(b"password-nonces").unwrap();
+        vault.store("k", b"v1").unwrap();
+        let first: Vec<Vec<u8>> = vault
+            .index
+            .files
+            .values()
+            .map(|m| m.encrypted_data.as_ref().unwrap()[..XCHACHA20_NONCE_LEN].to_vec())
+            .collect();
+        vault.store("k", b"v1").unwrap();
+        let second: Vec<Vec<u8>> = vault
+            .index
+            .files
+            .values()
+            .map(|m| m.encrypted_data.as_ref().unwrap()[..XCHACHA20_NONCE_LEN].to_vec())
+            .collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0], second[0]);
+    }
+
+    // Group G: change_password handling of dummy and inconsistent entries.
+
+    #[test]
+    fn change_password_drops_dummies_and_keeps_real_entries() {
+        let mut vault = Vault::create(b"old-password").unwrap();
+        vault.store("real", b"payload").unwrap();
+        vault.index.files.insert(
+            format!("{:064x}", 0),
+            IndexMetaBlockMetadata::new(IndexMetaBlockLocation::Inline, 0, 0, true, None, None, 0),
+        );
+
+        vault
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+
+        assert_eq!(vault.retrieve("real").unwrap(), Some(b"payload".to_vec()));
+        // Only the re-encrypted real entry survives.
+        assert_eq!(vault.index.files.len(), 1);
+    }
+
+    #[test]
+    fn change_password_rejects_real_entry_missing_ciphertext() {
+        let mut vault = Vault::create(b"old-password").unwrap();
+        vault.store("real", b"payload").unwrap();
+        // Non-dummy entry without ciphertext fields: the index is
+        // inconsistent and the password change must fail, not silently drop.
+        vault.index.files.insert(
+            format!("{:064x}", 1),
+            IndexMetaBlockMetadata::new(IndexMetaBlockLocation::Inline, 0, 0, false, None, None, 0),
+        );
+
+        assert!(matches!(
+            vault.change_password(b"old-password", b"new-password"),
+            Err(VaultError::CorruptedData(_))
+        ));
+        // The failed change leaves the original vault usable.
+        assert_eq!(vault.retrieve("real").unwrap(), Some(b"payload".to_vec()));
     }
 }

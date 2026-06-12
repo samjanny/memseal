@@ -18,6 +18,11 @@
   back by `open()` (the authoritative counter is recovered from the
   encrypted index JSON), so it is dead weight. Requires a `VAULT_VERSION`
   bump and is acceptable here because 0.2.x already ships an API break.
+- Use a denser encoding for ciphertext bytes in the index (base64 or a
+  binary index format) instead of JSON number arrays, which cost roughly
+  3.6 output bytes per stored byte and cap the practical aggregate
+  plaintext at about 70 MiB (see `DESIGN.md` section 9.3). Requires a
+  `VAULT_INDEX_VERSION` bump; fits the same 0.2.x format-break window.
 
 ## 0.3.x - KDF configuration and review
 

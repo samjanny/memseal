@@ -203,7 +203,7 @@ impl Drop for SecureMemoryVault {
         self.ciphertext.zeroize();
         std::sync::atomic::compiler_fence(Ordering::SeqCst);
 
-        // munlock using the saved pointer/length — zeroize clears the Vec
+        // munlock using the saved pointer/length - zeroize clears the Vec
         // so we can't rely on ciphertext.as_ptr()/len() after zeroize.
         if was_locked && !ptr.is_null() && len > 0 {
             unsafe { munlock(ptr, len) };
