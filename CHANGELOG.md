@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-10
+
 ### Security
 
 * `Vault::open` now caps the plaintext header at `MAX_HEADER_JSON_LEN` (4 KiB) before deserializing it. The header is parsed before anything is authenticated, and the previous bound was the 256 MiB file cap, so a crafted file could force a 256 MiB JSON parse in `open()` or `load()`. A real header is about 150 bytes.
@@ -163,7 +165,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/samjanny/memseal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/samjanny/memseal/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/samjanny/memseal/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/samjanny/memseal/compare/v0.1.4...v0.1.5
