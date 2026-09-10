@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::marker::PhantomData;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Errors that can occur in vault index operations.
 #[derive(Debug, Error)]
@@ -33,7 +33,7 @@ pub enum IndexError {
 }
 
 /// Where an entry's data is stored.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Zeroize)]
 pub enum IndexMetaBlockLocation {
     LargeFile {
         metablock_uid: String,
@@ -46,7 +46,10 @@ pub enum IndexMetaBlockLocation {
 }
 
 /// Metadata for a single entry in the vault index.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Zeroized on drop, so ciphertexts that are replaced, removed, or released
+/// with the vault do not linger in freed memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct IndexMetaBlockMetadata {
     pub location: IndexMetaBlockLocation,
     pub created: u64,
@@ -174,7 +177,8 @@ impl<N> VaultIndex<N> {
     }
 
     /// Inserts an entry, hashing the plaintext name with HMAC-SHA256.
-    /// If an entry with the same name already exists, its encrypted fields are zeroized.
+    /// If an entry with the same name already exists it is dropped, which
+    /// zeroizes its encrypted fields.
     pub fn insert_file(
         &mut self,
         plaintext_name: &str,
@@ -189,14 +193,7 @@ impl<N> VaultIndex<N> {
                 MAX_INDEX_ENTRIES
             )));
         }
-        if let Some(mut old) = self.files.insert(hashed_key, metadata) {
-            if let Some(ref mut data) = old.encrypted_data {
-                data.zeroize();
-            }
-            if let Some(ref mut name) = old.encrypted_name {
-                name.zeroize();
-            }
-        }
+        self.files.insert(hashed_key, metadata);
         Ok(())
     }
 
@@ -216,6 +213,20 @@ impl<N> VaultIndex<N> {
     ) -> Result<Option<IndexMetaBlockMetadata>, IndexError> {
         let hashed_key = self.hmac_filename(plaintext_name)?;
         Ok(self.files.remove(&hashed_key))
+    }
+}
+
+impl<N> Drop for VaultIndex<N> {
+    fn drop(&mut self) {
+        // Entry values zeroize themselves on drop. Wipe the HMAC-derived map
+        // keys, the index nonce, and the salt copy as well so no index
+        // metadata lingers in freed memory. The subkey vaults have their own
+        // Drop.
+        for (mut key, _meta) in self.files.drain() {
+            key.zeroize();
+        }
+        self.nonce.zeroize();
+        self.kdf_salt.zeroize();
     }
 }
 
@@ -276,7 +287,7 @@ impl VaultIndex<NonceNotRotated> {
         )
     }
 
-    /// Reconstructs an index from a master key and deserialized fields (used by `Vault::open`).
+    /// Reconstructs an index from a master key and deserialized fields.
     pub fn from_master_key_and_data(
         master_key: &[u8],
         salt: &[u8],
@@ -285,14 +296,42 @@ impl VaultIndex<NonceNotRotated> {
         data_nonce_counter: u64,
         files: HashMap<String, IndexMetaBlockMetadata>,
     ) -> Result<Self, IndexError> {
-        // Data nonces are derived from (enc_key, data_counter); with enc_key
-        // fixed for the vault's lifetime, nonce uniqueness depends entirely on
-        // data_nonce_counter never reissuing a counter already used by an
-        // entry. A vault produced by this library always advances the counter
-        // past every stored entry, so on reopen data_nonce_counter must be
-        // strictly greater than the largest stored data_counter. A violation
-        // means the (authenticated) index is inconsistent; reject it rather
-        // than risk a future store() reusing a (enc_key, data_counter) pair.
+        let (mut enc_sub, mut hmac_sub) = derive_subkeys(master_key, salt)?;
+        let result = Self::from_subkeys_and_data(
+            &enc_sub,
+            &hmac_sub,
+            salt,
+            nonce,
+            nonce_counter,
+            data_nonce_counter,
+            files,
+        );
+        enc_sub.zeroize();
+        hmac_sub.zeroize();
+        result
+    }
+
+    /// Reconstructs an index from already-derived subkeys and deserialized
+    /// fields. `Vault::open` uses this so that HKDF runs exactly once per
+    /// open; the caller owns and zeroizes `enc_sub` and `hmac_sub`.
+    pub fn from_subkeys_and_data(
+        enc_sub: &[u8; SUBKEY_LEN],
+        hmac_sub: &[u8; SUBKEY_LEN],
+        salt: &[u8],
+        nonce: [u8; XCHACHA20_NONCE_LEN],
+        nonce_counter: u64,
+        data_nonce_counter: u64,
+        files: HashMap<String, IndexMetaBlockMetadata>,
+    ) -> Result<Self, IndexError> {
+        // Entry nonces are random and stored with each ciphertext (DESIGN.md
+        // section 5), so this check is not about nonce uniqueness. The
+        // counter still feeds the per-entry AAD (hmac_key_hex || data_counter):
+        // a vault written by this library always advances data_nonce_counter
+        // past every stored entry, so on reopen it must be strictly greater
+        // than the largest stored data_counter. A violation means the
+        // (authenticated) index is inconsistent; reject it rather than let a
+        // later store() reissue a (name, counter) AAD pair under which an
+        // older ciphertext for that name could be replayed.
         if let Some(max_counter) = files.values().map(|m| m.data_counter).max()
             && data_nonce_counter <= max_counter
         {
@@ -302,15 +341,10 @@ impl VaultIndex<NonceNotRotated> {
             )));
         }
 
-        let (mut enc_sub, mut hmac_sub) = derive_subkeys(master_key, salt)?;
-
-        let enc_vault = SecureMemoryVault::new(&enc_sub)
+        let enc_vault =
+            SecureMemoryVault::new(enc_sub).map_err(|e| IndexError::GenericError(e.to_string()))?;
+        let hmac_vault = SecureMemoryVault::new(hmac_sub)
             .map_err(|e| IndexError::GenericError(e.to_string()))?;
-        let hmac_vault = SecureMemoryVault::new(&hmac_sub)
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
-
-        enc_sub.zeroize();
-        hmac_sub.zeroize();
 
         VaultIndex::from_data(
             VAULT_INDEX_VERSION,
@@ -417,7 +451,7 @@ impl IndexMetaBlockMetadata {
 
 impl NonceRotation for VaultIndex<NonceNotRotated> {
     type Output = VaultIndex<NonceRotated>;
-    fn rotate_nonce(self) -> Result<Self::Output, NonceRotationError> {
+    fn rotate_nonce(mut self) -> Result<Self::Output, NonceRotationError> {
         let new_counter = self
             .nonce_counter
             .checked_add(1)
@@ -426,15 +460,17 @@ impl NonceRotation for VaultIndex<NonceNotRotated> {
         let mut new_nonce = [0u8; XCHACHA20_NONCE_LEN];
         secure_bytes_fill(&mut new_nonce).map_err(|_| NonceRotationError::NonceRotationFailed)?;
 
+        // `VaultIndex` implements Drop, so the fields are moved out with
+        // `take` and the emptied source is dropped normally afterwards.
         Ok(VaultIndex {
             version: self.version,
             nonce: new_nonce,
             nonce_counter: new_counter,
             data_nonce_counter: self.data_nonce_counter,
-            files: self.files,
-            enc_key: self.enc_key,
-            hmac_key: self.hmac_key,
-            kdf_salt: self.kdf_salt,
+            files: std::mem::take(&mut self.files),
+            enc_key: self.enc_key.take(),
+            hmac_key: self.hmac_key.take(),
+            kdf_salt: std::mem::take(&mut self.kdf_salt),
             _state: PhantomData,
         })
     }
@@ -487,7 +523,9 @@ impl SecureAccess for VaultIndex<NonceRotated> {
             .as_ref()
             .ok_or(EncryptionError::SecretKeyGenerationFailed)?;
 
-        let mut collected = zeroize::Zeroizing::new(Vec::new());
+        // Sized up front so extend_from_slice never reallocates and leaves
+        // an unwiped copy of the key behind in the old allocation.
+        let mut collected = zeroize::Zeroizing::new(Vec::with_capacity(enc_vault.len()));
         enc_vault
             .access(|key_bytes, _tag| {
                 collected.extend_from_slice(key_bytes);
@@ -726,9 +764,27 @@ mod tests {
     }
 
     #[test]
+    fn metadata_zeroize_clears_ciphertext_fields() {
+        let mut meta = IndexMetaBlockMetadata::new(
+            IndexMetaBlockLocation::Inline,
+            1,
+            2,
+            false,
+            Some(vec![9u8; 8]),
+            Some(vec![7u8; 8]),
+            3,
+        );
+        meta.zeroize();
+        assert_eq!(meta.encrypted_data, None);
+        assert_eq!(meta.encrypted_name, None);
+        assert_eq!(meta.data_counter, 0);
+    }
+
+    #[test]
     fn from_master_key_and_data_rejects_counter_not_ahead_of_entries() {
         // data_nonce_counter must be strictly greater than the largest stored
-        // data_counter, otherwise a later store() could reuse a nonce.
+        // data_counter, otherwise a later store() could reissue an AAD
+        // counter that is already bound to a stored ciphertext.
         let master = [0x11u8; 32];
         let salt = [0x22u8; 16];
         let mut files = HashMap::new();

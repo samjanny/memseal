@@ -51,29 +51,38 @@ ciphertext with a 16-byte Poly1305 tag appended.
 Total file size is bounded by `MAX_VAULT_FILE_SIZE = 256 MiB`, enforced on
 both sides: `Vault::load` refuses to read a larger file, and
 `Vault::export` refuses to produce one (so anything `export()`/`save()`
-emits can be loaded back). The `header_len` field is also bounded by this
-value; values larger than `MAX_VAULT_FILE_SIZE` are rejected before any
-allocation.
+emits can be loaded back). The `header_len` field has its own, much
+tighter bound, `MAX_HEADER_JSON_LEN = 4 KiB`: the header is plaintext and
+is parsed before anything has been authenticated, and a real header is
+about 150 bytes. Larger values are rejected before the JSON is touched.
 
 ### 2.1 Parsing rules enforced by `Vault::open`
 
 In order, `Vault::open(password, data)` enforces:
 
 1. `data.len() >= 4` (room for `header_len`).
-2. `header_len <= MAX_VAULT_FILE_SIZE`.
-3. `4 + header_len` does not overflow `usize`.
-4. `data.len() >= 4 + header_len + 24 + 8` (room for nonce and counter).
-5. `header_json` parses as valid `VaultHeader` JSON.
-6. `validate_header(&header)` succeeds (see section 3).
-7. XChaCha20-Poly1305 verification of `encrypted_index` succeeds with the
-   serialized header JSON as AAD.
-8. The decrypted index JSON parses and its `version` is in
-   `SUPPORTED_VAULT_INDEX_VERSIONS`.
+2. `header_len <= MAX_HEADER_JSON_LEN` (4 KiB). This also rules out any
+   offset overflow in the steps below.
+3. `data.len() >= 4 + header_len + 24 + 8` (room for nonce and counter).
+4. `header_json` parses as valid `VaultHeader` JSON.
+5. `validate_header(&header)` succeeds (see section 3). This is the last
+   check before Argon2i runs with the parameters taken from the header.
+6. Argon2i and HKDF derive the subkeys, then XChaCha20-Poly1305
+   verification of `encrypted_index` succeeds with the serialized header
+   JSON as AAD.
+7. The decrypted index JSON parses, its `version` is in
+   `SUPPORTED_VAULT_INDEX_VERSIONS`, its `files` map holds at most
+   `MAX_INDEX_ENTRIES` entries, and no entry carries an `encrypted_data`
+   or `encrypted_name` blob larger than `store()` can produce (section 8).
+8. `data_nonce_counter` is strictly greater than every stored
+   `data_counter` (section 7).
 
-Failures at steps 1-6 return `VaultError::CorruptedData(...)`. Failure at
-step 7 returns `VaultError::InvalidPassword` (the AEAD does not
-distinguish "wrong key" from "tampered ciphertext or AAD" by design).
-Failure at step 8 returns `VaultError::CorruptedData(...)`.
+Failures at steps 1-5 return `VaultError::CorruptedData(...)`. Failure at
+step 6 returns `VaultError::InvalidPassword`: the AEAD does not
+distinguish "wrong key" from "tampered ciphertext or AAD" by design, so
+the variant means "authentication failed", not "the password was
+mistyped". Failure at step 7 returns `VaultError::CorruptedData(...)` and
+failure at step 8 returns `VaultError::CryptoError(...)`.
 
 
 ## 3. Header (`VaultHeader`)
@@ -84,9 +93,13 @@ Serialized as JSON. Fields (all required, no serde defaults):
 | ----------------- | -------- | ----------------------------------------------- |
 | `version`         | u16      | must equal `VAULT_VERSION` (currently `1`)      |
 | `kdf_salt`        | [u8; 16] | random salt for Argon2i                         |
-| `kdf_iterations`  | u32      | Argon2i `t`, in `[MIN_KDF_ITERATIONS, 100]`     |
-| `kdf_memory_cost` | u32      | Argon2i `m` in KiB, in `[MIN_KDF_MEMORY, 4 GiB]`|
+| `kdf_iterations`  | u32      | Argon2i `t`, in `[3, 10]`                       |
+| `kdf_memory_cost` | u32      | Argon2i `m` in KiB, in `[32 MiB, 256 MiB]`      |
 | `key_length`      | usize    | must equal `KEY_LEN` (currently `32`)           |
+
+The KDF bounds are deliberately narrow; section 10.1 explains the policy.
+Every vault written by this library uses the defaults (128 MiB, 4
+iterations), which sit inside both ranges.
 
 The header has two responsibilities:
 
@@ -130,9 +143,13 @@ The `enc_key` is used for all XChaCha20-Poly1305 operations on the index
 and on per-entry payloads. The `hmac_key` is used exclusively for
 HMAC-SHA256 of entry names (see section 7).
 
-Both subkeys are stored in `SecureMemoryVault` (mlock'd ciphertext
-buffers) for the lifetime of the `Vault` and zeroized on drop. The raw
-master key is zeroized as soon as the subkeys are derived.
+Both subkeys are stored in `SecureMemoryVault` for the lifetime of the
+`Vault`. Each container encrypts its subkey under a fresh in-memory
+XChaCha20-Poly1305 stream key and keeps that key, its nonce, and the
+ciphertext in a single `mlock`'d allocation (on Linux also marked
+`MADV_DONTDUMP` by `memsec`), which is zeroized on drop. The raw master
+key is zeroized as soon as the subkeys are derived; `open()` derives them
+exactly once.
 
 
 ## 5. Nonce generation
@@ -232,6 +249,14 @@ impractical to embed many more than this in a single 256 MiB file; the
 explicit cap on `open()` closes the gap so a crafted index cannot force a
 larger map than the format allows.
 
+`open()` also checks every entry's ciphertext sizes against what `store()`
+can produce: `encrypted_data` is at most `24 + MAX_ENTRY_DATA_SIZE + 16`
+bytes and `encrypted_name` at most `24 + MAX_ENTRY_NAME_LEN + 16` bytes
+(nonce prefix, plaintext bound, Poly1305 tag). The 256 MiB file bound
+already makes larger blobs impractical; the explicit check keeps
+`retrieve()` and `change_password()` from allocating for a blob outside
+the documented limits and fails on `open()` with `CorruptedData` instead.
+
 
 ## 8. Per-entry encryption
 
@@ -311,16 +336,47 @@ All inputs that affect parsing memory or CPU are bounded before use:
 | ------------------------- | ---------------------------- | ---------------------------- |
 | file size (reading)       | `MAX_VAULT_FILE_SIZE = 256 MiB` | `Vault::load`             |
 | file size (writing)       | `MAX_VAULT_FILE_SIZE = 256 MiB` | `Vault::export`           |
-| `header_len`              | `<= MAX_VAULT_FILE_SIZE`     | `Vault::open` step 2         |
+| `header_len`              | `<= MAX_HEADER_JSON_LEN (4 KiB)` | `Vault::open` step 2     |
 | `header.version`          | in `SUPPORTED_VAULT_VERSIONS`| `validate_header`            |
-| `header.kdf_memory_cost`  | `[MIN_KDF_MEMORY, 4 GiB]`    | `validate_header`            |
-| `header.kdf_iterations`   | `[MIN_KDF_ITERATIONS, 100]`  | `validate_header`            |
+| `header.kdf_memory_cost`  | `[32 MiB, 256 MiB]`          | `validate_header`            |
+| `header.kdf_iterations`   | `[3, 10]`                    | `validate_header`            |
 | `header.key_length`       | `== KEY_LEN (32)`            | `validate_header`            |
-| index `version`           | in `SUPPORTED_VAULT_INDEX_VERSIONS` | `Vault::open` step 8  |
+| index `version`           | in `SUPPORTED_VAULT_INDEX_VERSIONS` | `Vault::open` step 7  |
 | entry name length         | `<= MAX_ENTRY_NAME_LEN (255)`| `Vault::store`               |
 | entry data size           | `<= MAX_ENTRY_DATA_SIZE (64 MiB)` | `Vault::store`          |
+| `encrypted_data` length   | `<= 24 + 64 MiB + 16`        | `Vault::open` step 7         |
+| `encrypted_name` length   | `<= 24 + 255 + 16`           | `Vault::open` step 7         |
 | index entry count         | `<= MAX_INDEX_ENTRIES (1024)`| `VaultIndex::insert_file`, `Vault::open` |
 | password length           | `>= MIN_PASSWORD_LEN (8)`    | `Vault::create`              |
+
+### 10.1 Pre-authentication cost and KDF policy
+
+Nothing in a vault file can be trusted until the index AEAD verifies,
+and verification needs the master key, so Argon2i necessarily runs with
+parameters taken from the unauthenticated header. The bounds above cap
+what a forged file can make `open()` or `load()` spend before it is
+rejected:
+
+* at most 4 KiB of header JSON is parsed;
+* at most one Argon2i derivation with a 256 MiB working set and 10
+  passes, which is also the size of the largest file `load()` reads;
+* HKDF and one AEAD verification over at most 256 MiB of ciphertext.
+
+The lower bounds serve the opposite goal: any file this library agrees to
+open costs an attacker at least 32 MiB and 3 passes per password guess,
+so a "memseal vault" produced by a buggy or hostile writer cannot be
+made cheap to brute force. 32 MiB and 3 passes match libsodium's
+interactive Argon2i memory limit and its minimum operations count (RFC
+9106 also recommends at least 3 passes for Argon2i).
+
+Every vault written so far uses the defaults, 128 MiB and 4 iterations,
+so tightening the accepted range is a compatible refinement (section 11).
+When configurable KDF presets ship (see `ROADMAP.md`), the range may be
+widened, but only within a policy that keeps the worst case above small.
+Integrators that open attacker-supplied files should still treat
+`open()` and `load()` as expensive untrusted-input parsers: bounded is
+not free, and `InvalidPassword` on a tampered file means every retry
+repeats the derivation.
 
 
 ## 11. Versioning

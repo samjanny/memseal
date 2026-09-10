@@ -24,7 +24,8 @@
 use crate::constants::argon2::KEY_LEN;
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::constants::{
-    MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, MIN_PASSWORD_LEN,
+    MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MAX_HEADER_JSON_LEN, MAX_KDF_ITERATIONS,
+    MAX_KDF_MEMORY, MAX_VAULT_FILE_SIZE, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, MIN_PASSWORD_LEN,
     SUPPORTED_VAULT_VERSIONS, VAULT_VERSION,
 };
 use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
@@ -36,13 +37,17 @@ use crate::vault::vault_index::{
     IndexMetaBlockLocation, IndexMetaBlockMetadata, VaultIndex, derive_subkeys,
 };
 use orion::hazardous::kdf::argon2i;
+use orion::hazardous::mac::poly1305::POLY1305_OUTSIZE;
+use std::collections::HashMap;
 use std::io::Read as IoRead;
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
-const MAX_KDF_MEMORY: u32 = 4_194_304; // 4 GiB
-const MAX_KDF_ITERATIONS: u32 = 100;
-const MAX_VAULT_FILE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+/// Largest `encrypted_data` blob `store` can produce: nonce prefix, the
+/// largest accepted plaintext, and the Poly1305 tag.
+const MAX_ENCRYPTED_DATA_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_DATA_SIZE + POLY1305_OUTSIZE;
+/// Largest `encrypted_name` blob `store` can produce.
+const MAX_ENCRYPTED_NAME_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_NAME_LEN + POLY1305_OUTSIZE;
 
 /// An encrypted in-memory vault for storing named secrets.
 ///
@@ -94,7 +99,20 @@ impl Vault {
 
     /// Opens an existing vault from exported bytes.
     ///
-    /// Returns [`VaultError::InvalidPassword`] if the password is wrong.
+    /// `data` is treated as untrusted input. The header is length-capped and
+    /// its KDF parameters are range-checked before Argon2 runs, so the most
+    /// a forged file can cost is one Argon2i derivation at 256 MiB and 10
+    /// passes; see `DESIGN.md` section 10.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::InvalidPassword`] when the encrypted index fails
+    /// to authenticate. The AEAD cannot tell a wrong password from a
+    /// tampered, truncated, or corrupted file, so this variant covers both;
+    /// callers that retry on it repeat the full key derivation each time.
+    /// Structural problems found before or after authentication (bad length
+    /// fields, malformed header, out-of-range parameters, an inconsistent
+    /// index) return [`VaultError::CorruptedData`].
     pub fn open(password: &[u8], data: &[u8]) -> Result<Self, VaultError> {
         if data.len() < 4 {
             return Err(VaultError::CorruptedData("Data too short".to_string()));
@@ -102,21 +120,18 @@ impl Vault {
 
         let header_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
 
-        if header_len > MAX_VAULT_FILE_SIZE as usize {
-            return Err(VaultError::CorruptedData(
-                "Header length too large".to_string(),
-            ));
+        // The header is plaintext and is parsed before anything has been
+        // authenticated, so it gets its own tight bound rather than the
+        // 256 MiB file cap. This also rules out any offset overflow below.
+        if header_len > MAX_HEADER_JSON_LEN {
+            return Err(VaultError::CorruptedData(format!(
+                "Header length {} exceeds maximum {}",
+                header_len, MAX_HEADER_JSON_LEN
+            )));
         }
 
-        let after_header = 4usize
-            .checked_add(header_len)
-            .ok_or(VaultError::CorruptedData(
-                "Header length overflow".to_string(),
-            ))?;
-
-        let min_total = after_header
-            .checked_add(XCHACHA20_NONCE_LEN + 8)
-            .ok_or(VaultError::CorruptedData("Size overflow".to_string()))?;
+        let after_header = 4 + header_len;
+        let min_total = after_header + XCHACHA20_NONCE_LEN + 8;
 
         if data.len() < min_total {
             return Err(VaultError::CorruptedData(
@@ -137,74 +152,78 @@ impl Vault {
         let counter_start = after_header + XCHACHA20_NONCE_LEN;
         let encrypted_index = &data[counter_start + 8..];
 
-        let mut master_key = derive_master_key(password, &header)?;
-        let mut enc_sub = [0u8; 32];
-
-        let result = (|| -> Result<Self, VaultError> {
-            let (e, _h) = derive_subkeys(&master_key, &header.kdf_salt)
-                .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-            enc_sub = e;
-
-            let aad = header.to_aad_bytes()?;
-            // Wrap in Zeroizing so the decrypted index (HMAC entry names, nonce
-            // counters, structural metadata) is cleared on scope exit, matching
-            // how master_key and enc_sub are handled below.
-            let index_json = zeroize::Zeroizing::new(
-                open_with_aad(&enc_sub, &nonce, encrypted_index, &aad)
-                    .map_err(|_| VaultError::InvalidPassword)?,
-            );
-
-            #[derive(serde::Deserialize)]
-            struct IndexData {
-                version: u16,
-                nonce: [u8; XCHACHA20_NONCE_LEN],
-                nonce_counter: u64,
-                data_nonce_counter: u64,
-                files: std::collections::HashMap<String, IndexMetaBlockMetadata>,
-            }
-
-            let idx_data: IndexData = serde_json::from_slice(&index_json)
-                .map_err(|e| VaultError::CorruptedData(format!("Invalid index JSON: {}", e)))?;
-
-            if !crate::constants::vault_index_constants::SUPPORTED_VAULT_INDEX_VERSIONS
-                .contains(&idx_data.version)
-            {
-                return Err(VaultError::CorruptedData(format!(
-                    "Unsupported index version: {}",
-                    idx_data.version
-                )));
-            }
-
-            let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
-            if idx_data.files.len() > max_index_entries {
-                return Err(VaultError::CorruptedData(format!(
-                    "Index entry count {} exceeds maximum {}",
-                    idx_data.files.len(),
-                    max_index_entries
-                )));
-            }
-
-            let index = VaultIndex::from_master_key_and_data(
-                &master_key,
-                &header.kdf_salt,
-                idx_data.nonce,
-                idx_data.nonce_counter,
-                idx_data.data_nonce_counter,
-                idx_data.files,
-            )
+        // Argon2 is the expensive step; everything above is cheap. The two
+        // subkeys are derived exactly once and the master key is dropped
+        // right away. Zeroizing wipes each buffer on every exit path,
+        // including the early returns below.
+        let master_key = Zeroizing::new(derive_master_key(password, &header)?);
+        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt)
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let enc_sub = Zeroizing::new(enc_sub);
+        let hmac_sub = Zeroizing::new(hmac_sub);
+        drop(master_key);
 
-            Ok(Vault { header, index })
-        })();
+        let aad = header.to_aad_bytes()?;
+        // The decrypted index (HMAC entry names, nonce counters, structural
+        // metadata) is cleared on scope exit as well.
+        let index_json = Zeroizing::new(
+            open_with_aad(&enc_sub, &nonce, encrypted_index, &aad)
+                .map_err(|_| VaultError::InvalidPassword)?,
+        );
 
-        master_key.zeroize();
-        enc_sub.zeroize();
-        result
+        #[derive(serde::Deserialize)]
+        struct IndexData {
+            version: u16,
+            nonce: [u8; XCHACHA20_NONCE_LEN],
+            nonce_counter: u64,
+            data_nonce_counter: u64,
+            files: HashMap<String, IndexMetaBlockMetadata>,
+        }
+
+        let idx_data: IndexData = serde_json::from_slice(&index_json)
+            .map_err(|e| VaultError::CorruptedData(format!("Invalid index JSON: {}", e)))?;
+
+        if !crate::constants::vault_index_constants::SUPPORTED_VAULT_INDEX_VERSIONS
+            .contains(&idx_data.version)
+        {
+            return Err(VaultError::CorruptedData(format!(
+                "Unsupported index version: {}",
+                idx_data.version
+            )));
+        }
+
+        let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+        if idx_data.files.len() > max_index_entries {
+            return Err(VaultError::CorruptedData(format!(
+                "Index entry count {} exceeds maximum {}",
+                idx_data.files.len(),
+                max_index_entries
+            )));
+        }
+
+        validate_entry_sizes(&idx_data.files)?;
+
+        let index = VaultIndex::from_subkeys_and_data(
+            &enc_sub,
+            &hmac_sub,
+            &header.kdf_salt,
+            idx_data.nonce,
+            idx_data.nonce_counter,
+            idx_data.data_nonce_counter,
+            idx_data.files,
+        )
+        .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+
+        Ok(Vault { header, index })
     }
 
     /// Loads a vault from a file on disk.
     ///
-    /// Reads at most 256 MiB to prevent resource exhaustion.
+    /// Reads at most 256 MiB, then hands the bytes to [`Vault::open`], so the
+    /// same untrusted-input bounds and error mapping apply. The path is
+    /// opened with the platform defaults, which follow symbolic links;
+    /// callers that accept paths from untrusted sources must validate them
+    /// first.
     pub fn load(path: &Path, password: &[u8]) -> Result<Self, VaultError> {
         let file = std::fs::File::open(path)?;
         let mut limited = file.take(MAX_VAULT_FILE_SIZE + 1);
@@ -311,6 +330,11 @@ impl Vault {
     /// secret inside `f`; such copies are caller-owned and are not zeroized by
     /// the vault.
     ///
+    /// A miss costs one HMAC and a map probe, a hit additionally runs an AEAD
+    /// decryption, so call timing reveals whether a name exists. This is not
+    /// a concern for a local vault but matters if names arrive from untrusted
+    /// parties over a network.
+    ///
     /// # Examples
     ///
     /// ```
@@ -403,23 +427,14 @@ impl Vault {
     }
 
     /// Removes a secret by name. Returns `true` if it existed.
+    ///
+    /// The removed entry's ciphertexts are zeroized when it is dropped.
     pub fn remove(&mut self, name: &str) -> Result<bool, VaultError> {
         let removed = self
             .index
             .remove_file(name)
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
-        if let Some(mut meta) = removed {
-            if let Some(ref mut data) = meta.encrypted_data {
-                data.zeroize();
-            }
-            if let Some(ref mut name_data) = meta.encrypted_name {
-                name_data.zeroize();
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(removed.is_some())
     }
 
     /// Serializes the vault to bytes for persistence.
@@ -481,7 +496,15 @@ impl Vault {
 
     /// Saves the vault to a file on disk.
     ///
-    /// Uses atomic write (temp file + rename) with 0600 permissions on Unix.
+    /// Writes a temporary file in the same directory, fsyncs it, renames it
+    /// over `path`, and fsyncs the directory. On Unix the file is created
+    /// with mode `0600`. On Windows no ACL is applied: the file inherits the
+    /// DACL of its directory, so callers who need owner-only access there
+    /// must restrict the directory or set the ACL themselves after saving.
+    ///
+    /// Symbolic links in the directory components of `path` are followed; a
+    /// link at `path` itself is replaced by the rename, not written through.
+    /// Each call advances the vault's nonce counter, see [`Vault::export`].
     pub fn save(&mut self, path: &Path) -> Result<(), VaultError> {
         use std::io::Write;
 
@@ -529,6 +552,13 @@ impl Vault {
     ///
     /// Re-derives all keys from the new password and re-encrypts every entry
     /// one at a time (at most one plaintext in memory at any given time).
+    ///
+    /// The current password is verified by exporting and re-opening the
+    /// vault, which runs the Argon2 derivation for the current password
+    /// before the new one is derived and advances the index nonce counter
+    /// even when verification fails. Returns [`VaultError::InvalidPassword`]
+    /// if `current_password` does not authenticate the vault; the vault is
+    /// then left unchanged apart from that counter and stays fully usable.
     pub fn change_password(
         &mut self,
         current_password: &[u8],
@@ -540,10 +570,11 @@ impl Vault {
         // Note: export() advances the nonce counter on self. If the password
         // check fails, self has a different nonce but is otherwise unchanged
         // and fully functional. This is acceptable because the nonce counter
-        // is monotonic and the vault data is intact.
-        let mut exported = self.export()?;
+        // is monotonic and the vault data is intact. Zeroizing wipes the
+        // exported copy on the error path as well.
+        let exported = Zeroizing::new(self.export()?);
         let _ = Vault::open(current_password, &exported)?;
-        exported.zeroize();
+        drop(exported);
 
         let new_header = VaultHeader::generate()?;
         let mut new_master_key = derive_master_key(new_password, &new_header)?;
@@ -706,6 +737,33 @@ fn validate_export_size(len: u64) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Rejects an (already authenticated) index whose per-entry ciphertexts are
+/// larger than anything `store` can produce, so `retrieve` and
+/// `change_password` never allocate for a blob outside the documented bounds.
+fn validate_entry_sizes(files: &HashMap<String, IndexMetaBlockMetadata>) -> Result<(), VaultError> {
+    for meta in files.values() {
+        if let Some(data) = &meta.encrypted_data
+            && data.len() > MAX_ENCRYPTED_DATA_LEN
+        {
+            return Err(VaultError::CorruptedData(format!(
+                "Entry data ciphertext of {} bytes exceeds maximum {}",
+                data.len(),
+                MAX_ENCRYPTED_DATA_LEN
+            )));
+        }
+        if let Some(name) = &meta.encrypted_name
+            && name.len() > MAX_ENCRYPTED_NAME_LEN
+        {
+            return Err(VaultError::CorruptedData(format!(
+                "Entry name ciphertext of {} bytes exceeds maximum {}",
+                name.len(),
+                MAX_ENCRYPTED_NAME_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
     let key_bytes = hmac_key.as_bytes();
     let counter_bytes = counter.to_le_bytes();
@@ -766,6 +824,7 @@ fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_L
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::argon2;
 
     #[test]
     fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
@@ -1060,6 +1119,32 @@ mod tests {
     }
 
     #[test]
+    fn header_validation_rejects_iterations_above_max() {
+        let bad = VaultHeader::new([0; 16], MAX_KDF_ITERATIONS + 1, 131_072, 32);
+        assert!(validate_header(&bad).is_err());
+    }
+
+    #[test]
+    fn header_validation_rejects_iterations_below_min() {
+        let bad = VaultHeader::new([0; 16], MIN_KDF_ITERATIONS - 1, 131_072, 32);
+        assert!(validate_header(&bad).is_err());
+    }
+
+    #[test]
+    fn header_validation_accepts_inclusive_bounds_and_defaults() {
+        // The defaults every vault is written with must sit inside the
+        // accepted range, and both ends of the range are inclusive.
+        for (iterations, memory) in [
+            (argon2::ITERATIONS, argon2::MEMORY_COST),
+            (MIN_KDF_ITERATIONS, MIN_KDF_MEMORY),
+            (MAX_KDF_ITERATIONS, MAX_KDF_MEMORY),
+        ] {
+            let header = VaultHeader::new([0; 16], iterations, memory, 32);
+            assert!(validate_header(&header).is_ok());
+        }
+    }
+
+    #[test]
     fn short_password_rejected() {
         assert!(Vault::create(b"short").is_err());
     }
@@ -1112,14 +1197,50 @@ mod tests {
 
     #[test]
     fn open_rejects_header_len_exceeding_available_bytes() {
-        // header_len within MAX_VAULT_FILE_SIZE but larger than provided bytes.
+        // header_len within MAX_HEADER_JSON_LEN but larger than provided bytes.
         // Exercises the `data.len() < min_total` branch, distinct from the
-        // `header_len > MAX_VAULT_FILE_SIZE` branch covered by
-        // `header_len_overflow_rejected`.
+        // `header_len > MAX_HEADER_JSON_LEN` branch covered by
+        // `header_len_overflow_rejected` and the cap tests below.
         let mut data = vec![0u8; 64];
-        data[..4].copy_from_slice(&10_000u32.to_le_bytes());
+        data[..4].copy_from_slice(&1_000u32.to_le_bytes());
         let result = Vault::open(b"password", &data);
         assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_len_above_cap_before_parsing() {
+        // Enough bytes are present for the declared header, so the only
+        // reason to fail is the cap itself; the JSON must never be parsed.
+        let header_len = MAX_HEADER_JSON_LEN + 1;
+        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN + 8];
+        data[..4].copy_from_slice(&(header_len as u32).to_le_bytes());
+        match Vault::open(b"password", &data) {
+            Err(VaultError::CorruptedData(msg)) => {
+                assert!(msg.contains("Header length"), "unexpected message: {}", msg)
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+            Ok(_) => panic!("oversized header accepted"),
+        }
+    }
+
+    #[test]
+    fn open_accepts_header_len_at_cap_then_fails_on_json() {
+        // Exactly at the cap the length check passes and the (garbage)
+        // header reaches the JSON parser, which rejects it.
+        let header_len = MAX_HEADER_JSON_LEN;
+        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN + 8];
+        data[..4].copy_from_slice(&(header_len as u32).to_le_bytes());
+        match Vault::open(b"password", &data) {
+            Err(VaultError::CorruptedData(msg)) => {
+                assert!(
+                    msg.contains("Invalid header JSON"),
+                    "unexpected message: {}",
+                    msg
+                )
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+            Ok(_) => panic!("garbage header accepted"),
+        }
     }
 
     #[test]
@@ -1228,6 +1349,20 @@ mod tests {
         let new_json = serde_json::to_vec(&value).unwrap();
         let tampered = replace_header_json(&valid, &new_json);
         let result = Vault::open(b"password-gggg", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_header_with_out_of_range_kdf_iterations() {
+        let valid = make_valid_export(b"password-iiii");
+        let mut value = extract_header_value(&valid);
+        value.as_object_mut().unwrap().insert(
+            "kdf_iterations".to_string(),
+            serde_json::Value::Number((MAX_KDF_ITERATIONS + 1).into()),
+        );
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-iiii", &tampered);
         assert!(matches!(result, Err(VaultError::CorruptedData(_))));
     }
 
@@ -1437,16 +1572,9 @@ mod tests {
     // in-memory map than the format allows.
 
     /// Forges a vault export whose encrypted index contains `entry_count`
-    /// entries, sealed correctly under the key derived from `password`.
+    /// dummy entries, sealed correctly under the key derived from `password`.
     fn forge_export_with_entries(password: &[u8], entry_count: usize) -> Vec<u8> {
-        use crate::vault::vault_index::derive_subkeys;
-
-        let header = VaultHeader::generate().unwrap();
-        let mut master_key = derive_master_key(password, &header).unwrap();
-        let (mut enc_sub, _hmac_sub) = derive_subkeys(&master_key, &header.kdf_salt).unwrap();
-        master_key.zeroize();
-
-        let mut files = std::collections::HashMap::new();
+        let mut files = HashMap::new();
         for i in 0..entry_count {
             files.insert(
                 format!("{:064x}", i),
@@ -1461,6 +1589,22 @@ mod tests {
                 ),
             );
         }
+        forge_export_with_files(password, files)
+    }
+
+    /// Forges a vault export whose encrypted index holds exactly `files`,
+    /// sealed correctly under the key derived from `password`. Entries must
+    /// use `data_counter` 0.
+    fn forge_export_with_files(
+        password: &[u8],
+        files: HashMap<String, IndexMetaBlockMetadata>,
+    ) -> Vec<u8> {
+        use crate::vault::vault_index::derive_subkeys;
+
+        let header = VaultHeader::generate().unwrap();
+        let mut master_key = derive_master_key(password, &header).unwrap();
+        let (mut enc_sub, _hmac_sub) = derive_subkeys(&master_key, &header.kdf_salt).unwrap();
+        master_key.zeroize();
 
         // Any unique nonce works: open() reads the nonce from the file and
         // never re-derives it.
@@ -1511,6 +1655,78 @@ mod tests {
             Vault::open(password, &data),
             Err(VaultError::CorruptedData(_))
         ));
+    }
+
+    // Per-entry ciphertext bounds. `store` can never produce blobs above
+    // these sizes, so an authenticated index that contains one is rejected
+    // on open instead of being allocated for later by retrieve.
+
+    fn single_entry_files(
+        encrypted_data: Option<Vec<u8>>,
+        encrypted_name: Option<Vec<u8>>,
+    ) -> HashMap<String, IndexMetaBlockMetadata> {
+        let mut files = HashMap::new();
+        files.insert(
+            format!("{:064x}", 0),
+            IndexMetaBlockMetadata::new(
+                IndexMetaBlockLocation::Inline,
+                0,
+                0,
+                false,
+                encrypted_data,
+                encrypted_name,
+                0,
+            ),
+        );
+        files
+    }
+
+    #[test]
+    fn validate_entry_sizes_bounds_are_inclusive() {
+        let at_bound = single_entry_files(
+            Some(vec![0u8; MAX_ENCRYPTED_DATA_LEN]),
+            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN]),
+        );
+        assert!(validate_entry_sizes(&at_bound).is_ok());
+
+        let data_over = single_entry_files(Some(vec![0u8; MAX_ENCRYPTED_DATA_LEN + 1]), None);
+        assert!(matches!(
+            validate_entry_sizes(&data_over),
+            Err(VaultError::CorruptedData(_))
+        ));
+
+        let name_over = single_entry_files(None, Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN + 1]));
+        assert!(matches!(
+            validate_entry_sizes(&name_over),
+            Err(VaultError::CorruptedData(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_entry_name_ciphertext_over_bound() {
+        let password: &[u8] = b"password-name-big";
+        let files = single_entry_files(
+            Some(vec![0u8; XCHACHA20_NONCE_LEN + POLY1305_OUTSIZE]),
+            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN + 1]),
+        );
+        let data = forge_export_with_files(password, files);
+        assert!(matches!(
+            Vault::open(password, &data),
+            Err(VaultError::CorruptedData(_))
+        ));
+    }
+
+    #[test]
+    fn open_accepts_entry_ciphertexts_at_bound() {
+        // Sizes exactly at the bound pass the structural check; the blobs
+        // are garbage, so a later retrieve fails on the AEAD, not on open.
+        let password: &[u8] = b"password-name-max";
+        let files = single_entry_files(
+            Some(vec![0u8; XCHACHA20_NONCE_LEN + POLY1305_OUTSIZE]),
+            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN]),
+        );
+        let data = forge_export_with_files(password, files);
+        assert!(Vault::open(password, &data).is_ok());
     }
 
     // Group F: export size bound and nonce freshness.

@@ -7,6 +7,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+* `Vault::open` now caps the plaintext header at `MAX_HEADER_JSON_LEN` (4 KiB) before deserializing it. The header is parsed before anything is authenticated, and the previous bound was the 256 MiB file cap, so a crafted file could force a 256 MiB JSON parse in `open()` or `load()`. A real header is about 150 bytes.
+* The KDF parameters accepted from a vault header are now bounded to 32 MiB to 256 MiB of memory and 3 to 10 iterations (previously 8 KiB to 4 GiB and 1 to 100). The header is unauthenticated when Argon2i runs, so the old upper bound let a 300-byte forged file trigger a 4 GiB allocation and 100 passes before the AEAD could reject it, and the old lower bound accepted files that were cheap to brute force. Every vault written by this library uses 128 MiB and 4 iterations, so existing files are unaffected. The policy is documented in `DESIGN.md` section 10.1 and pinned by compile-time assertions in `constants.rs`.
+* `SecureMemoryVault` now keeps the in-memory stream key and nonce inside the same `mlock`'d allocation as the ciphertext they protect, generated in place after the lock is taken. Previously only the ciphertext was locked (and, on Linux, excluded from core dumps) while the key that decrypts it lived in ordinary memory, so a swap or core dump could contain the key but not the buffer. The container no longer holds raw pointers, and the `unsafe impl Send`/`Sync` for it are gone.
+* `SecureMemoryVault::access` wraps its plaintext scratch buffer in `Zeroizing`, so it is wiped when the callback panics and unwinds, not only on normal return and error.
+* `Vault::open` derives the HKDF subkeys once and drops the master key immediately; the HMAC subkey was previously derived twice and the first copy discarded without zeroization. `change_password` zeroizes its verification export on the wrong-password path as well.
+* Index entry metadata is now zeroized on drop, so ciphertexts that are replaced, removed, or released with the vault do not linger in freed memory; the index also wipes its HMAC-derived map keys and nonce on drop.
+* `Vault::open` rejects an index whose `encrypted_data` or `encrypted_name` blobs are larger than `store()` can produce (`24 + 64 MiB + 16` and `24 + 255 + 16` bytes), so `retrieve()` and `change_password()` never allocate for an out-of-bounds entry.
+
+### Changed
+
+* `VaultError` is now `#[non_exhaustive]`, and the eight variants that were never constructed (`InvalidHeader`, `InvalidIndex`, `InvalidDataBlock`, `InvalidMetaBlock`, `InvalidPath`, `InvalidVersion`, `InvalidFormat`, `EntryNotFound`) are removed. Downstream `match` expressions need a wildcard arm. Breaking for exhaustive matches.
+* The `Display` text of `VaultError::InvalidPassword` is now "Vault authentication failed: wrong password or tampered data", and its documentation states that the variant covers tampered, truncated, and corrupted vaults as well as a wrong password, since the AEAD cannot tell them apart. Callers should not retry on it in a loop: each attempt repeats the Argon2 derivation.
+* `Vault::remove` and `VaultIndex::insert_file` rely on the new drop-time zeroization instead of wiping replaced or removed ciphertexts by hand.
+
+### Fixed
+
+* `SecureAccess::secure_access` (unused by the `Vault` facade) sizes its key buffer up front instead of growing a `Zeroizing<Vec>` from empty, which could reallocate and leave an unwiped copy of the subkey behind.
+* Replaced a stale comment in `VaultIndex` that still described counter-derived entry nonces; entry nonces have been random since 0.1.6, and the `data_nonce_counter` check guards the per-entry AAD, not nonce uniqueness.
+
+### Documentation
+
+* `Vault::save` documents that the `0600` mode applies to Unix only and that Windows files inherit the directory DACL; `load` and `save` document that they follow symbolic links. The README threat model gains rows for both.
+* `with_secret` and the README note that lookup timing reveals whether an entry exists.
+* `SECURITY.md` lists 0.2.x as the supported series, states that Argon2i is used because `orion` has no Argon2id, and explains that one bounded Argon2i derivation on a hostile file is by design.
+* `DESIGN.md` sections 2, 2.1, 3, 4, 7, and 10 reflect the new bounds and the locked-region layout, with a new section 10.1 on the pre-authentication cost policy.
+
+### Dependencies
+
+* Updated `Cargo.lock`: `crossbeam-epoch` 0.9.18 to 0.9.21 (RUSTSEC-2026-0204, reachable only through the `criterion` dev-dependency) and `anyhow` 1.0.102 to 1.0.104 (RUSTSEC-2026-0190, reachable only through `getrandom`'s WASI path).
+
 ## [0.2.0] - 2026-09-10
 
 ### Added

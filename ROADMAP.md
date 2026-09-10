@@ -32,7 +32,7 @@
 - Allow callers to choose Argon2 memory cost and iteration count through bounded presets or a validated builder API.
 - Preserve secure defaults for casual users.
 - Store KDF parameters in the vault header and authenticate them as AAD.
-- Reject unsafe, malformed, or resource-exhaustive KDF parameters when opening vaults.
+- Revisit the fixed bounds `open()` enforces today (32 MiB to 256 MiB, 3 to 10 iterations) once presets exist, keeping the worst-case cost of opening a hostile file small.
 - Preserve compatibility with existing vault formats where possible.
 
 ## 0.4.x - Format and threat-model documentation

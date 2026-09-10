@@ -112,6 +112,8 @@ fn main() -> Result<(), VaultError> {
 | Entry data | Maximum 64 MiB |
 | Vault file | Maximum 256 MiB |
 | Index entries | Maximum 1024 |
+| Header JSON | Maximum 4 KiB |
+| KDF parameters accepted by `open()` | 32 MiB to 256 MiB memory, 3 to 10 iterations |
 
 The 256 MiB file bound is enforced on both sides: `load()` refuses larger
 files and `export()`/`save()` refuse to produce them. Encrypted entry
@@ -224,12 +226,12 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Tampered vault data** | The vault header is authenticated as AAD for index decryption; the index JSON and every per-entry payload are encrypted and authenticated with XChaCha20-Poly1305. Bit flips in authenticated header fields, nonces, ciphertext, or Poly1305 tags are detected during `open()` or entry retrieval. |
 | **Entry swap attacks** | Each entry's data and name ciphertexts share an AAD made of the entry's HMAC-derived key and its `data_counter`. Swapping either the encrypted data or the encrypted name across entries causes AEAD verification to fail. |
 | **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
-| **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: out-of-range values (for example, below-minimum memory cost or zero iterations) are rejected by `validate_header()` during `open()`, blocking forged headers that would make password guessing artificially cheap. |
+| **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: `open()` accepts only 32 MiB to 256 MiB of memory and 3 to 10 iterations, so a forged header can neither make password guessing cheap nor force more than one 256 MiB, 10-pass derivation before the file is rejected. See `DESIGN.md` section 10.1. |
 | **Nonce reuse** | All XChaCha20 nonces are 24-byte values drawn from the OS CSPRNG and stored next to the ciphertext they protect: a fresh index nonce on every `export()`, fresh entry data/name nonces on every `store()`. Random generation also covers state forks: two vault instances opened from the same persisted bytes cannot repeat a nonce when both export, which counter-derived nonces would. Monotonic counters remain as authenticated state, are bound into entry AAD, and overflow at `u64::MAX` is a hard error. |
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
-| **Resource exhaustion from crafted files** | Vault file size, header length, KDF parameters, entry name length, entry data size, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap. |
-| **Swap exposure of ciphertext buffers** | Internal ciphertext buffers in `SecureMemoryVault` are locked with `mlock` via `memsec` where supported. |
+| **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap or whose entries are larger than `store()` can produce. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
+| **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `SecureMemoryVault`: it is encrypted under a fresh stream key, and the key, its nonce, and the ciphertext share one allocation locked with `mlock` via `memsec` where supported (on Linux also excluded from core dumps) and zeroized on drop. |
 
 ### Out of scope / limitations
 
@@ -238,11 +240,13 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Kernel-level or root attacker** | A privileged attacker can read process memory regardless of user-space protections. |
 | **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed, including inside a `with_secret()` callback, or after it has been returned by `retrieve()`. |
 | **Caller-owned plaintext leaks** | `with_secret()` keeps the library-owned buffer scoped to a callback and zeroizes it afterward, but cannot prevent the callback from making copies. `retrieve()` returns `Vec<u8>` directly. The caller remains responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
-| **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. |
+| **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. This includes the timing difference between a hit and a miss in `retrieve()`/`with_secret()`, which reveals whether a name exists to anyone who can time calls. |
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
 | **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |
-| **Full swap protection** | Only internal ciphertext buffers are locked. Internal keys, nonces, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
+| **Full swap protection** | Only the two `SecureMemoryVault` allocations that hold the subkeys are locked. Transient copies made during each operation, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
 | **Rollback protection** | memseal does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless the application stores freshness/version information externally. |
+| **File permissions on Windows** | `save()` creates the file with mode `0600` on Unix only. On Windows the file inherits the DACL of its directory; restricting it is the caller's job. |
+| **Untrusted paths** | `load()` and `save()` follow symbolic links like any `std::fs` call and do not validate the path. Callers that accept paths from untrusted sources must validate them first; `open()`/`load()` bound the work a hostile file can cause but do not make it free. |
 | **Formal cryptographic assurance** | The crate has not been independently audited. The integration layer should be reviewed before high-risk use. |
 
 ## Architecture
@@ -276,7 +280,7 @@ Index encryption:
   vault header is authenticated as AAD
 ```
 
-Note: `mlock` is applied only to internal ciphertext buffers inside `SecureMemoryVault`. It does not lock every secret-related allocation.
+Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold the two subkeys (each one stream key, nonce, and ciphertext). It does not lock every secret-related allocation.
 
 ## Cryptographic Primitives
 
@@ -287,19 +291,19 @@ Note: `mlock` is applied only to internal ciphertext buffers inside `SecureMemor
 | XChaCha20-Poly1305 | `orion` | Authenticated encryption |
 | HMAC-SHA256 | `orion` | Entry-name hashing |
 | OsRng | `rand_core` | Random salt and nonce generation |
-| `mlock` / `munlock` | `memsec` | Best-effort locking of internal ciphertext buffers |
+| `mlock` / `munlock` | `memsec` | Best-effort locking of the in-memory subkey containers |
 | Zeroization | `zeroize` | Clearing internal temporary secrets where possible |
 
 ## Security Properties
 
 - **Small public API.** The crate exposes `Vault` and `VaultError`; internal modules are private.
-- **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for `mlock`/`munlock` and `unsafe impl Send/Sync`.
+- **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for the `mlock`/`munlock` calls only; it keeps no raw pointers, so `Send`/`Sync` need no `unsafe impl`.
 - **Domain separation.** Subkey derivation uses distinct HKDF `info` labels for the encryption and HMAC keys.
 - **Authenticated encryption.** Vault index data and entries are encrypted with AEAD.
-- **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing.
-- **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix.
+- **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing; a hostile file can cost at most one bounded Argon2i derivation (256 MiB, 10 passes) before it is rejected.
+- **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix (Windows inherits the directory ACL).
 - **Best-effort memory hygiene.** Internal temporary key material and plaintext are zeroized where possible.
-- **Partial swap protection.** Internal ciphertext buffers are locked with `mlock` where supported, but this does not cover every allocation.
+- **Partial swap protection.** The in-memory subkey containers (stream key, nonce, and ciphertext together) are locked with `mlock` where supported, but this does not cover every allocation.
 
 ## Comparison
 
