@@ -34,6 +34,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 * `Vault::save` documents that the `0600` mode applies to Unix only and that Windows files inherit the directory DACL; `load` and `save` document that they follow symbolic links. The README threat model gains rows for both.
 * `with_secret` and the README note that lookup timing reveals whether an entry exists.
+* The README gains an "Errors" section describing every `VaultError` variant, the wildcard arm that `#[non_exhaustive]` requires, and the variants removed in this release.
 * `SECURITY.md` lists 0.2.x as the supported series, states that Argon2i is used because `orion` has no Argon2id, and explains that one bounded Argon2i derivation on a hostile file is by design.
 * `DESIGN.md` sections 2, 2.1, 3, 4, 7, and 10 reflect the new bounds and the locked-region layout, with a new section 10.1 on the pre-authentication cost policy.
 

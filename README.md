@@ -122,6 +122,51 @@ bytes per stored byte), so the practical bound on total stored plaintext
 across all entries is about 70 MiB; `export()` fails cleanly when it is
 exceeded and the vault stays usable. See `DESIGN.md` section 9.3.
 
+### Errors
+
+Every fallible call returns `VaultError`. The enum is `#[non_exhaustive]`,
+so a `match` on it needs a wildcard arm:
+
+```rust
+use memseal::{Vault, VaultError};
+
+fn main() {
+    let bytes = {
+        let mut vault = Vault::create(b"my-password-here").unwrap();
+        vault.store("api_key", b"sk-secret-12345").unwrap();
+        vault.export().unwrap()
+    };
+
+    match Vault::open(b"wrong-password", &bytes) {
+        Ok(_) => unreachable!("the password is wrong"),
+        // Wrong password, or the bytes were tampered with: the AEAD gives a
+        // single verdict, so the library cannot tell the two apart. Do not
+        // retry in a loop; every attempt repeats the Argon2 derivation.
+        Err(VaultError::InvalidPassword) => {}
+        // Length fields, header, or index are malformed or out of bounds.
+        Err(VaultError::CorruptedData(msg)) => panic!("corrupted vault: {msg}"),
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}
+```
+
+| Variant | Meaning |
+|---------|---------|
+| `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault. |
+| `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, index version, entry count, entry sizes). |
+| `CryptoError(String)` | A cryptographic operation failed, or an input violated a limit (password, entry name, entry data). |
+| `SerializationError(String)` | Serializing the vault failed, or the export exceeds 256 MiB. |
+| `IoError(std::io::Error)` | A file operation in `load()` or `save()` failed. |
+| `InvalidKey` | The in-memory encryption subkey is unavailable (internal invariant). |
+
+A missing entry is not an error: `retrieve()` and `with_secret()` return
+`Ok(None)`, and `remove()` returns `Ok(false)`.
+
+Upgrading from 0.1.x or 0.2.0: the variants `InvalidHeader`, `InvalidIndex`,
+`InvalidDataBlock`, `InvalidMetaBlock`, `InvalidPath`, `InvalidVersion`,
+`InvalidFormat`, and `EntryNotFound` were removed in 0.2.1. None of them was
+ever returned, so only exhaustive `match` expressions need to change.
+
 ## Handling Plaintext
 
 Prefer `with_secret()` when plaintext only needs to be used temporarily. It
