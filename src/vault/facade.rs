@@ -8,17 +8,17 @@
 //! let mut vault = Vault::create(b"my-password-here").unwrap();
 //!
 //! vault.store("api_key", b"sk-secret-12345").unwrap();
-//! assert_eq!(
-//!     vault.retrieve("api_key").unwrap(),
-//!     Some(b"sk-secret-12345".to_vec())
-//! );
+//! let matches = vault
+//!     .with_secret("api_key", |secret| secret == b"sk-secret-12345")
+//!     .unwrap();
+//! assert_eq!(matches, Some(true));
 //!
 //! let bytes = vault.export().unwrap();
 //! let reopened = Vault::open(b"my-password-here", &bytes).unwrap();
-//! assert_eq!(
-//!     reopened.retrieve("api_key").unwrap(),
-//!     Some(b"sk-secret-12345".to_vec())
-//! );
+//! let matches = reopened
+//!     .with_secret("api_key", |secret| secret == b"sk-secret-12345")
+//!     .unwrap();
+//! assert_eq!(matches, Some(true));
 //! ```
 
 use crate::constants::argon2::KEY_LEN;
@@ -38,7 +38,7 @@ use crate::vault::vault_index::{
 use orion::hazardous::kdf::argon2i;
 use std::io::Read as IoRead;
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_KDF_MEMORY: u32 = 4_194_304; // 4 GiB
 const MAX_KDF_ITERATIONS: u32 = 100;
@@ -300,10 +300,66 @@ impl Vault {
         result
     }
 
-    /// Retrieves a secret by name, decrypting it.
+    /// Decrypts a secret and exposes it to `f` for the duration of the call.
+    ///
+    /// The library-owned plaintext buffer is zeroized immediately after `f`
+    /// returns, including when `f` unwinds. The callback is not invoked and
+    /// `Ok(None)` is returned if no secret with that name exists.
+    ///
+    /// The callback's return value may leave the closure, but it cannot borrow
+    /// the temporary plaintext buffer. Callers can still deliberately copy the
+    /// secret inside `f`; such copies are caller-owned and are not zeroized by
+    /// the vault.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    ///
+    /// let length = vault
+    ///     .with_secret("api_key", |secret| secret.len())
+    ///     .unwrap();
+    /// assert_eq!(length, Some(15));
+    /// ```
+    ///
+    /// A reference to the temporary plaintext cannot escape the callback:
+    ///
+    /// ```compile_fail
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    /// let secret: &[u8] = vault
+    ///     .with_secret("api_key", |plaintext| plaintext)
+    ///     .unwrap()
+    ///     .unwrap();
+    /// ```
+    pub fn with_secret<R, F>(&self, name: &str, f: F) -> Result<Option<R>, VaultError>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let plaintext = match self.decrypt_secret(name)? {
+            Some(plaintext) => Zeroizing::new(plaintext),
+            None => return Ok(None),
+        };
+
+        Ok(Some(f(plaintext.as_slice())))
+    }
+
+    /// Retrieves a secret by name, decrypting it into a caller-owned buffer.
     ///
     /// Returns `Ok(None)` if no secret with that name exists.
+    /// Prefer [`Vault::with_secret`] when the plaintext only needs to be used
+    /// temporarily. The caller is responsible for clearing the returned
+    /// buffer from memory.
     pub fn retrieve(&self, name: &str) -> Result<Option<Vec<u8>>, VaultError> {
+        self.decrypt_secret(name)
+    }
+
+    fn decrypt_secret(&self, name: &str) -> Result<Option<Vec<u8>>, VaultError> {
         let hmac_key = self
             .index
             .lookup_hmac_key_for_name(name)
@@ -759,6 +815,68 @@ mod tests {
             reopened.retrieve("api_key").unwrap(),
             Some(b"sk-secret-12345".to_vec())
         );
+    }
+
+    #[test]
+    fn with_secret_borrows_plaintext_and_returns_callback_value() {
+        let mut vault = Vault::create(b"test-password").unwrap();
+        vault.store("api_key", b"sk-secret-12345").unwrap();
+
+        let observed = vault
+            .with_secret("api_key", |secret| {
+                assert_eq!(secret, b"sk-secret-12345");
+                secret.len()
+            })
+            .unwrap();
+
+        assert_eq!(observed, Some(15));
+    }
+
+    #[test]
+    fn with_secret_missing_does_not_invoke_callback() {
+        let vault = Vault::create(b"test-password").unwrap();
+        let mut invoked = false;
+
+        let result = vault
+            .with_secret("missing", |_| {
+                invoked = true;
+            })
+            .unwrap();
+
+        assert_eq!(result, None);
+        assert!(!invoked);
+    }
+
+    #[test]
+    fn with_secret_supports_empty_plaintext() {
+        let mut vault = Vault::create(b"test-password").unwrap();
+        vault.store("empty", b"").unwrap();
+
+        let is_empty = vault
+            .with_secret("empty", |secret| secret.is_empty())
+            .unwrap();
+
+        assert_eq!(is_empty, Some(true));
+    }
+
+    #[test]
+    fn with_secret_preserves_fallible_callback_result() {
+        let mut vault = Vault::create(b"test-password").unwrap();
+        vault.store("number", b"42").unwrap();
+
+        let parsed = vault
+            .with_secret("number", |secret| {
+                if secret == b"42" {
+                    Ok(42_u8)
+                } else {
+                    Err("unexpected value")
+                }
+            })
+            .unwrap()
+            .transpose()
+            .unwrap();
+
+        assert_eq!(parsed, Some(42));
     }
 
     #[test]

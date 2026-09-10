@@ -35,9 +35,11 @@ let bytes = vault.export().unwrap();
 
 // Reopen with the same password
 let vault = Vault::open(b"my-password-here", &bytes).unwrap();
-let api_key = vault.retrieve("api_key").unwrap();
+let matches = vault
+    .with_secret("api_key", |secret| secret == b"sk-secret-12345")
+    .unwrap();
 
-assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
+assert_eq!(matches, Some(true));
 ```
 
 ## File Persistence
@@ -56,8 +58,10 @@ fn main() -> Result<(), VaultError> {
 
     // Later: load and retrieve
     let vault = Vault::load(Path::new("secrets.seal"), b"my-password-here")?;
-    let api_key = vault.retrieve("api_key")?;
-    assert_eq!(api_key, Some(b"sk-secret-12345".to_vec()));
+    let matches = vault.with_secret("api_key", |secret| {
+        secret == b"sk-secret-12345"
+    })?;
+    assert_eq!(matches, Some(true));
 
     Ok(())
 }
@@ -75,10 +79,10 @@ fn main() -> Result<(), VaultError> {
     // Create
     let mut vault = Vault::create(password)?;
 
-    // Store, retrieve, remove
+    // Store, access, remove
     vault.store("name", b"secret")?;
-    let data = vault.retrieve("name")?;  // Option<Vec<u8>>
-    assert_eq!(data, Some(b"secret".to_vec()));
+    let matches = vault.with_secret("name", |secret| secret == b"secret")?;
+    assert_eq!(matches, Some(true));
     let existed = vault.remove("name")?; // bool
     assert!(existed);
 
@@ -118,7 +122,34 @@ exceeded and the vault stays usable. See `DESIGN.md` section 9.3.
 
 ## Handling Plaintext
 
-`retrieve()` returns decrypted data as `Option<Vec<u8>>`.
+Prefer `with_secret()` when plaintext only needs to be used temporarily. It
+decrypts the requested value, lends it to a closure as `&[u8]`, then zeroizes
+the library-owned plaintext allocation as soon as the closure returns:
+
+```rust
+use memseal::{Vault, VaultError};
+
+fn main() -> Result<(), VaultError> {
+    let mut vault = Vault::create(b"my-password-here")?;
+    vault.store("api_key", b"sk-secret-12345")?;
+
+    let authenticated = vault.with_secret("api_key", |secret| {
+        // Use the borrowed plaintext only inside this closure.
+        secret == b"sk-secret-12345"
+    })?;
+    assert_eq!(authenticated, Some(true));
+
+    Ok(())
+}
+```
+
+The callback is not called for a missing entry and `with_secret()` returns
+`Ok(None)`. Its return value may leave the closure, but borrowed plaintext
+cannot. A caller can still explicitly copy the bytes inside the callback; any
+such copy is caller-owned and cannot be cleared by the vault.
+
+For convenience and backwards compatibility, `retrieve()` returns decrypted
+data as `Option<Vec<u8>>`.
 
 This is convenient, but it means the caller owns the returned plaintext and is responsible for handling it carefully.
 
@@ -129,7 +160,8 @@ In particular, caller code should avoid:
 - keeping plaintext alive longer than needed;
 - assuming returned plaintext is protected by `mlock`.
 
-Internal temporary plaintext and key material are zeroized where possible, but returned plaintext belongs to the caller.
+Internal temporary plaintext and key material are zeroized where possible, but
+plaintext returned by `retrieve()` belongs to the caller.
 
 If the caller wants drop-time zeroization, the returned `Vec<u8>` can be wrapped by the caller using `zeroize::Zeroizing`:
 
@@ -204,8 +236,8 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | Threat | Reason |
 |--------|--------|
 | **Kernel-level or root attacker** | A privileged attacker can read process memory regardless of user-space protections. |
-| **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed or after it has been returned by `retrieve()`. |
-| **Caller-owned plaintext leaks** | `retrieve()` returns `Vec<u8>`. The caller is responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
+| **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed, including inside a `with_secret()` callback, or after it has been returned by `retrieve()`. |
+| **Caller-owned plaintext leaks** | `with_secret()` keeps the library-owned buffer scoped to a callback and zeroizes it afterward, but cannot prevent the callback from making copies. `retrieve()` returns `Vec<u8>` directly. The caller remains responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
 | **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. |
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
 | **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |

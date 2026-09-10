@@ -27,6 +27,18 @@ fn bench_vault_retrieve(c: &mut Criterion) {
     });
 }
 
+fn bench_vault_with_secret(c: &mut Criterion) {
+    let mut vault = Vault::create(b"benchmark-password").unwrap();
+    vault.store("target_key", b"target-value-data").unwrap();
+    c.bench_function("Vault::with_secret", |b| {
+        b.iter(|| {
+            vault
+                .with_secret("target_key", |secret| std::hint::black_box(secret).len())
+                .unwrap()
+        });
+    });
+}
+
 fn bench_vault_export(c: &mut Criterion) {
     let mut vault = Vault::create(b"benchmark-password").unwrap();
     vault.store("key1", b"value1").unwrap();
@@ -54,6 +66,7 @@ criterion_group!(
     bench_vault_create,
     bench_vault_store,
     bench_vault_retrieve,
+    bench_vault_with_secret,
     bench_vault_export,
     bench_vault_roundtrip,
 );

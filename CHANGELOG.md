@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
+### Added
+
+* Added `Vault::with_secret`, a callback-based plaintext access API. The
+  decrypted buffer is borrowed only for the callback invocation and is
+  zeroized immediately afterward, including during normal panic unwinding.
+  Missing entries return `Ok(None)` without invoking the callback. `retrieve()`
+  remains available as the caller-owned plaintext convenience API.
+
 ## [0.1.6] - 2026-06-12
 
 ### Security
@@ -121,7 +131,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/samjanny/memseal/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/samjanny/memseal/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/samjanny/memseal/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/samjanny/memseal/compare/v0.1.3...v0.1.4

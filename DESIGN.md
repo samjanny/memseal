@@ -148,9 +148,9 @@ protect:
 | entry name   | `Vault::store()` per call     | first 24 bytes of `encrypted_name`          |
 
 Nonces are never re-derived when reading: `open()` uses the nonce read
-from the file, and `retrieve()` / `change_password()` use the nonce
-prefixed to each entry ciphertext. XChaCha20's 192-bit nonce is sized
-precisely so that random generation makes collisions negligible.
+from the file, and `with_secret()` / `retrieve()` / `change_password()` use
+the nonce prefixed to each entry ciphertext. XChaCha20's 192-bit nonce is
+sized precisely so that random generation makes collisions negligible.
 
 Random generation (rather than derivation from a monotonic counter, as in
 formats up to 0.1.5) also covers the state-fork case: if the same

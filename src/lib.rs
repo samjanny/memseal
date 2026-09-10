@@ -20,10 +20,10 @@
 //!
 //! // Reopen with the same password
 //! let reopened = Vault::open(b"my-password-here", &bytes).unwrap();
-//! assert_eq!(
-//!     reopened.retrieve("api_key").unwrap(),
-//!     Some(b"sk-secret-12345".to_vec()),
-//! );
+//! let matches = reopened
+//!     .with_secret("api_key", |secret| secret == b"sk-secret-12345")
+//!     .unwrap();
+//! assert_eq!(matches, Some(true));
 //! ```
 //!
 //! ## File Persistence
