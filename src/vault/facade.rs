@@ -512,7 +512,7 @@ impl Vault {
 /// bounds-checked but not yet authenticated. Everything in it is
 /// attacker-controlled until `encrypted_index` verifies under the key
 /// derived from `header`.
-struct Envelope<'a> {
+pub(crate) struct Envelope<'a> {
     header: VaultHeader,
     nonce: [u8; XCHACHA20_NONCE_LEN],
     encrypted_index: &'a [u8],
@@ -522,7 +522,7 @@ struct Envelope<'a> {
 /// any key derivation. It is pure and cheap, which is what makes it the
 /// right target for fuzzing the untrusted-input parser without paying for
 /// Argon2 on every input.
-fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
+pub(crate) fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
     if data.len() < 4 {
         return Err(VaultError::CorruptedData("Data too short".to_string()));
     }

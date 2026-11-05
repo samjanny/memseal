@@ -382,6 +382,17 @@ Run benchmarks with:
 cargo bench --bench full_bench
 ```
 
+Fuzz the untrusted-input parsers (nightly toolchain and `cargo-fuzz`):
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run parse_envelope fuzz/seeds/parse_envelope -- -max_total_time=300
+```
+
+The targets (`parse_envelope`, `decode_index`, `decode_index_v1`) call the
+parsers through the crate's `fuzzing` feature, which is not part of the
+public API and must never be enabled by a dependency. See `fuzz/README.md`.
+
 ## CI
 
 GitHub Actions runs on every push and PR to `main`:

@@ -11,6 +11,7 @@ categories = ["cryptography"]
 repository = "https://github.com/samjanny/memseal"
 documentation = "https://docs.rs/memseal"
 readme = "README.md"
+exclude = ["fuzz/"]
 
 [lib]
 name = "memseal"
@@ -27,6 +28,11 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
+
+[features]
+# Exposes the untrusted-input parsers to the fuzz targets in `fuzz/`. Not
+# part of the public API; never enable it in a dependency.
+fuzzing = []
 
 [dev-dependencies]
 criterion = "0.5.1"

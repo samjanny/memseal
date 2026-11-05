@@ -50,5 +50,8 @@ mod crypto;
 mod mem;
 mod vault;
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+
 pub use vault::facade::Vault;
 pub use vault::vault_error::VaultError;

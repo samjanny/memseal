@@ -37,7 +37,7 @@
 
 ## 0.5.x - Hardening
 
-- Add fuzzing for vault parsing.
+- Done: `cargo-fuzz` targets for the envelope parser and both index decoders live in `fuzz/`, behind the `fuzzing` feature.
 - Improve error taxonomy.
 - Add additional corruption/tampering tests.
 - Review `unsafe` boundaries and `Send`/`Sync` invariants.

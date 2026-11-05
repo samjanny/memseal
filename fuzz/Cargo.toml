@@ -1,0 +1,33 @@
+[package]
+name = "memseal-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+memseal = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "parse_envelope"
+path = "fuzz_targets/parse_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_index"
+path = "fuzz_targets/decode_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_index_v1"
+path = "fuzz_targets/decode_index_v1.rs"
+test = false
+doc = false
+bench = false
