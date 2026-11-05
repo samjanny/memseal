@@ -41,7 +41,7 @@ impl VaultHeader {
         })
     }
 
-    /// Generates a new header with a random salt and default Argon2i parameters.
+    /// Generates a new header with a random salt and default Argon2id parameters.
     pub fn generate() -> Result<Self, VaultError> {
         let mut kdf_salt = [0; SALT_LEN];
         secure_bytes_fill(&mut kdf_salt)?;

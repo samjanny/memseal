@@ -43,7 +43,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// An encrypted in-memory vault for storing named secrets.
 ///
 /// Secrets are encrypted with XChaCha20-Poly1305, keys are derived from a
-/// password via Argon2i, and all key material is zeroized on drop.
+/// password via Argon2id, and all key material is zeroized on drop.
 ///
 /// # Examples
 ///
@@ -84,7 +84,7 @@ impl Vault {
     ///
     /// `data` is treated as untrusted input. The header is length-capped and
     /// its KDF parameters are range-checked before Argon2 runs, so the most
-    /// a forged file can cost is one Argon2i derivation at 256 MiB and 10
+    /// a forged file can cost is one Argon2 derivation at 256 MiB and 10
     /// passes; see `DESIGN.md` section 10.
     ///
     /// Both the current format (version 2) and the format written by
@@ -426,7 +426,7 @@ impl Vault {
     ///
     /// `current_password` is verified by deriving its subkeys with the
     /// current header and comparing the encryption subkey with the one in
-    /// memory in constant time; this costs one Argon2i derivation and has no
+    /// memory in constant time; this costs one Argon2id derivation and has no
     /// side effects. Returns [`VaultError::InvalidPassword`] on a mismatch
     /// and leaves the vault untouched.
     ///
@@ -491,7 +491,7 @@ impl Vault {
     }
 
     /// Checks `password` against the keys in memory without touching the
-    /// vault: one Argon2i derivation with the current header, then a
+    /// vault: one Argon2id derivation with the current header, then a
     /// constant-time comparison of the derived encryption subkey with the
     /// stored one.
     fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
