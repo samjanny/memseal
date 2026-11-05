@@ -20,8 +20,8 @@
 
 ## 0.3.x - KDF configuration and review
 
-- Revisit Argon2i vs Argon2id.
-- Decide whether to keep Argon2i as a documented trade-off or introduce Argon2id for new vaults.
+- Done: format version 2 uses Argon2id (RustCrypto `argon2`); version 1
+  files are re-keyed on open (see `DESIGN.md` sections 4 and 12).
 - Add safe KDF configuration options.
 - Allow callers to choose Argon2 memory cost and iteration count through bounded presets or a validated builder API.
 - Preserve secure defaults for casual users.

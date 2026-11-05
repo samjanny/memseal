@@ -121,9 +121,11 @@ compact binary encoding (about 50 bytes of overhead per entry), so the
 bound on total stored secrets is a little under 256 MiB; `export()` fails
 cleanly when it is exceeded and the vault stays usable.
 
-Vault files written by releases up to 0.2.1 (format version 1, JSON index)
-are still opened transparently and rewritten in the current format on the
-next `export()` or `save()`. See `DESIGN.md` section 12.
+Vault files written by releases up to 0.2.1 (format version 1: JSON index,
+Argon2i) are still opened transparently. Opening one costs a second key
+derivation, because the vault is re-keyed with Argon2id in memory; the
+next `export()` or `save()` then writes the current format. See
+`DESIGN.md` section 12.
 
 ### Errors
 
@@ -278,11 +280,11 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Tampered vault data** | The vault header is authenticated as AAD for index decryption; the index and every per-entry payload are encrypted and authenticated with XChaCha20-Poly1305. Bit flips in authenticated header fields, nonces, ciphertext, or Poly1305 tags are detected during `open()` or entry retrieval. |
 | **Entry swap attacks** | Each entry's data and name ciphertexts share an AAD made of the entry's HMAC-derived key and its `data_counter`. Swapping either the encrypted data or the encrypted name across entries causes AEAD verification to fail. |
 | **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
-| **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: `open()` accepts only 32 MiB to 256 MiB of memory and 3 to 10 iterations, so a forged header can neither make password guessing cheap nor force more than one 256 MiB, 10-pass derivation before the file is rejected. See `DESIGN.md` section 10.1. |
+| **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2: `open()` accepts only 32 MiB to 256 MiB of memory and 3 to 10 iterations, so a forged header can neither make password guessing cheap nor force more than one 256 MiB, 10-pass derivation before the file is rejected. See `DESIGN.md` section 10.1. |
 | **Nonce reuse** | All XChaCha20 nonces are 24-byte values drawn from the OS CSPRNG and stored next to the ciphertext they protect: a fresh index nonce on every `export()`, fresh entry data/name nonces on every `store()`. Random generation also covers state forks: two vault instances opened from the same persisted bytes cannot repeat a nonce when both export, which counter-derived nonces would. Monotonic counters remain as authenticated state, are bound into entry AAD, and overflow at `u64::MAX` is a hard error. |
-| **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
+| **Key reuse across roles** | The Argon2id-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
-| **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. The binary index decoder checks every length against the remaining input and the documented bounds before copying, and rejects duplicate keys and trailing bytes. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
+| **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. The binary index decoder checks every length against the remaining input and the documented bounds before copying, and rejects duplicate keys and trailing bytes. The residual, deliberate cost of opening a hostile file is one bounded Argon2id derivation. |
 | **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `LockedSecret`: a `memsec` allocation that occupies pages of its own, sits between guard pages, is locked with `mlock` where supported (on Linux also excluded from core dumps), and is zeroized on drop. |
 
 ### Out of scope / limitations
@@ -306,7 +308,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 ```text
             Password (>= 8 bytes)
                |
-           Argon2i
+          Argon2id
       128 MiB, 4 iterations
       random 16-byte salt
                |
@@ -338,7 +340,7 @@ Note: `mlock` is applied only to the two `LockedSecret` allocations that hold th
 
 | Primitive | Implementation | Purpose |
 |-----------|----------------|---------|
-| Argon2i | `orion` | Password-based key derivation |
+| Argon2id | `argon2` (RustCrypto) | Password-based key derivation (Argon2i from `orion` for format version 1 files) |
 | HKDF-SHA256 | `orion` | Subkey derivation |
 | XChaCha20-Poly1305 | `orion` | Authenticated encryption |
 | HMAC-SHA256 | `orion` | Entry-name hashing |
@@ -352,7 +354,7 @@ Note: `mlock` is applied only to the two `LockedSecret` allocations that hold th
 - **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for the `memsec` allocation and locking calls and for the `Send`/`Sync` impls of the type that uniquely owns each locked region.
 - **Domain separation.** Subkey derivation uses distinct HKDF `info` labels for the encryption and HMAC keys.
 - **Authenticated encryption.** Vault index data and entries are encrypted with AEAD.
-- **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing; a hostile file can cost at most one bounded Argon2i derivation (256 MiB, 10 passes) before it is rejected.
+- **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing; a hostile file can cost at most one bounded Argon2id derivation (256 MiB, 10 passes) before it is rejected.
 - **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix (Windows inherits the directory ACL).
 - **Best-effort memory hygiene.** Internal temporary key material and plaintext are zeroized where possible.
 - **Partial swap protection.** The two subkey containers are locked with `mlock` where supported, but this does not cover every allocation.

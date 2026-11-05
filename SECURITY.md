@@ -35,13 +35,13 @@ The following are out of scope:
 - Side-channel attacks on the CPU (Spectre, cache timing)
 - Social engineering
 
-Note on `open()` and `load()`: the KDF parameters come from the unauthenticated header, so a hostile file can always cost one Argon2i derivation before it is rejected. That derivation is bounded to 256 MiB and 10 passes (`DESIGN.md` section 10.1); cost within that bound is by design and not a vulnerability, cost beyond it is.
+Note on `open()` and `load()`: the KDF parameters come from the unauthenticated header, so a hostile file can always cost one Argon2id derivation before it is rejected. That derivation is bounded to 256 MiB and 10 passes (`DESIGN.md` section 10.1); cost within that bound is by design and not a vulnerability, cost beyond it is.
 
 ## Security Audit Status
 
-This library has **not been independently audited**. It uses well-established cryptographic primitives (XChaCha20-Poly1305, Argon2i, HKDF-SHA256) from the [orion](https://crates.io/crates/orion) crate, but the integration layer has not been reviewed by a third-party security firm.
+This library has **not been independently audited**. It uses well-established cryptographic primitives (XChaCha20-Poly1305 and HKDF-SHA256 from the [orion](https://crates.io/crates/orion) crate, Argon2id from the RustCrypto [argon2](https://crates.io/crates/argon2) crate), but the integration layer has not been reviewed by a third-party security firm.
 
-The password KDF is Argon2i rather than Argon2id because `orion` does not implement Argon2id. Argon2i is the weaker variant against offline GPU cracking of a stolen vault file, which is the main threat to an exported vault; the switch is tracked for 0.3.x in `ROADMAP.md`.
+Vault files written by releases up to 0.2.1 were keyed with Argon2i, the only variant `orion` implements and the weaker one against offline GPU cracking of a stolen file. Such files are re-keyed with Argon2id the first time they are opened and saved by a current release; until then they keep the weaker KDF.
 
 ## Disclosure Policy
 

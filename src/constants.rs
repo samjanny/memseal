@@ -5,8 +5,9 @@ pub const VAULT_VERSION: u16 = 2;
 pub const LEGACY_VAULT_VERSION_1: u16 = 1;
 pub const SUPPORTED_VAULT_VERSIONS: [u16; 2] = [LEGACY_VAULT_VERSION_1, VAULT_VERSION];
 
-/// Argon2i parameters for password hashing.
-/// Note: orion only supports Argon2i (not Argon2id) with p=1.
+/// Argon2 parameters for password hashing: Argon2id with a single lane for
+/// the current format, Argon2i (the only variant `orion` offers) for format
+/// version 1. The same memory cost and pass count apply to both.
 pub mod argon2 {
     pub const MEMORY_COST: u32 = 131_072; // 128 MiB
     pub const ITERATIONS: u32 = 4;
@@ -28,15 +29,15 @@ pub mod xchacha20_poly1305 {
 
 // Bounds enforced by `validate_header` on the KDF parameters read from an
 // untrusted vault header (DESIGN.md sections 3 and 10). The header is parsed
-// and its parameters are fed to Argon2i before the password can be checked,
+// and its parameters are fed to Argon2 before the password can be checked,
 // so the upper bounds cap the memory and CPU a forged file can make
 // `Vault::open` spend before the AEAD rejects it, and the lower bounds keep
 // any file this library accepts from being cheap to brute force. Every vault
 // written so far uses the `argon2` defaults above, which sit inside both
 // ranges.
-pub const MIN_KDF_MEMORY: u32 = 32_768; // 32 MiB: libsodium's interactive Argon2i limit
+pub const MIN_KDF_MEMORY: u32 = 32_768; // 32 MiB: libsodium's interactive limit
 pub const MAX_KDF_MEMORY: u32 = 262_144; // 256 MiB: 2x default, equal to MAX_VAULT_FILE_SIZE
-pub const MIN_KDF_ITERATIONS: u32 = 3; // RFC 9106 / libsodium minimum for Argon2i
+pub const MIN_KDF_ITERATIONS: u32 = 3; // RFC 9106 minimum for Argon2i, conservative for Argon2id
 pub const MAX_KDF_ITERATIONS: u32 = 10;
 
 // Plaintext header JSON is deserialized before anything is authenticated;

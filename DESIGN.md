@@ -68,12 +68,12 @@ In order, `Vault::open(password, data)` enforces:
 3. `data.len() >= 4 + header_len + 24` (room for header and nonce).
 4. `header_json` parses as valid `VaultHeader` JSON.
 5. `validate_header(&header)` succeeds (see section 3). This is the last
-   check before Argon2i runs with the parameters taken from the header.
+   check before Argon2 runs with the parameters taken from the header.
    If `header.version` is 1, the 8 legacy counter bytes that follow the
    nonce must also be present and are skipped (section 12).
-6. Argon2i and HKDF derive the subkeys, then XChaCha20-Poly1305
-   verification of `encrypted_index` succeeds with the serialized header
-   JSON as AAD.
+6. Argon2id (Argon2i under a version 1 header) and HKDF derive the
+   subkeys, then XChaCha20-Poly1305 verification of `encrypted_index`
+   succeeds with the serialized header JSON as AAD.
 7. The decrypted index decodes under the rules of section 7 (version tag,
    entry count, every length against the remaining bytes and the
    documented bounds, no duplicate keys, no trailing bytes). A version 1
@@ -98,9 +98,14 @@ Serialized as JSON. Fields (all required, no serde defaults):
 | field             | type     | meaning                                         |
 | ----------------- | -------- | ----------------------------------------------- |
 | `version`         | u16      | must equal `VAULT_VERSION` (currently `1`)      |
-| `kdf_salt`        | [u8; 16] | random salt for Argon2i                         |
-| `kdf_iterations`  | u32      | Argon2i `t`, in `[3, 10]`                       |
-| `kdf_memory_cost` | u32      | Argon2i `m` in KiB, in `[32 MiB, 256 MiB]`      |
+| `kdf_salt`        | [u8; 16] | random salt for Argon2                          |
+| `kdf_iterations`  | u32      | Argon2 `t`, in `[3, 10]`                        |
+| `kdf_memory_cost` | u32      | Argon2 `m` in KiB, in `[32 MiB, 256 MiB]`       |
+
+The KDF variant is implied by `version`: Argon2id for version 2, Argon2i
+for version 1 (section 12). It is not a separate header field because a
+different variant is by definition a different format version (section
+11).
 | `key_length`      | usize    | must equal `KEY_LEN` (currently `32`)           |
 
 The KDF bounds are deliberately narrow; section 10.1 explains the policy.
@@ -128,12 +133,13 @@ to be aware of if a third party ever re-encodes the header.
 ```
 password (>= 8 bytes)
     |
-    | Argon2i (orion):
+    | Argon2id, version 0x13 (RustCrypto `argon2`):
     |   t = header.kdf_iterations  (default 4)
     |   m = header.kdf_memory_cost (default 131072 KiB = 128 MiB)
-    |   p = 1 (fixed; orion limitation)
+    |   p = 1 (single lane)
     |   salt = header.kdf_salt (16 bytes, random per vault)
     |   output = 32 bytes
+    |   (format version 1: Argon2i from orion, same t, m, p, salt)
     v
 master_key (32 bytes)
     |
@@ -292,8 +298,8 @@ entry_aad      = hmac_key_hex(plaintext_name) bytes || data_counter as u64 LE
 `store()` (section 5). The `data_counter` no longer drives nonce
 derivation; it remains in the AAD so that ciphertexts cannot be replayed
 across counter generations of the same entry name. The AAD uses the hex
-form of the key, as format version 1 did, so entry ciphertexts are
-carried over byte for byte when a legacy vault is migrated (section 12).
+form of the key, as format version 1 did; the raw 32-byte key in the
+index is only its storage encoding.
 
 Limits:
 
@@ -343,14 +349,16 @@ All inputs that affect parsing memory or CPU are bounded before use:
 ### 10.1 Pre-authentication cost and KDF policy
 
 Nothing in a vault file can be trusted until the index AEAD verifies,
-and verification needs the master key, so Argon2i necessarily runs with
+and verification needs the master key, so Argon2 necessarily runs with
 parameters taken from the unauthenticated header. The bounds above cap
 what a forged file can make `open()` or `load()` spend before it is
 rejected:
 
 * at most 4 KiB of header JSON is parsed;
-* at most one Argon2i derivation with a 256 MiB working set and 10
-  passes, which is also the size of the largest file `load()` reads;
+* at most one Argon2id derivation with a 256 MiB working set and 10
+  passes, which is also the size of the largest file `load()` reads
+  (a version 1 file costs a second derivation, Argon2id this time, only
+  after it has authenticated: section 12);
 * HKDF and one AEAD verification over at most 256 MiB of ciphertext,
   then one linear pass over the decrypted index.
 
@@ -358,8 +366,9 @@ The lower bounds serve the opposite goal: any file this library agrees to
 open costs an attacker at least 32 MiB and 3 passes per password guess,
 so a "memseal vault" produced by a buggy or hostile writer cannot be
 made cheap to brute force. 32 MiB and 3 passes match libsodium's
-interactive Argon2i memory limit and its minimum operations count (RFC
-9106 also recommends at least 3 passes for Argon2i).
+interactive memory limit and its Argon2i minimum operations count (RFC
+9106 recommends at least 3 passes for Argon2i; for Argon2id it allows
+fewer, so the floor is conservative).
 
 Every vault written so far uses the defaults, 128 MiB and 4 iterations,
 so tightening the accepted range is a compatible refinement (section 11).
@@ -487,7 +496,7 @@ For the foreseeable `0.x` releases:
 | Format 1 to format 2 (section 12)                   | A (shipped)    |
 | Add a new optional index field with a default       | not a break    |
 | Change a HKDF `info` prefix                         | B              |
-| Swap KDF algorithm                                  | B              |
+| Swap KDF algorithm                                  | B, or A when the re-keying can run in memory before anything is written (section 12) |
 | Change AEAD (e.g., XChaCha20-Poly1305 -> something) | B              |
 | Format known to be cryptographically broken         | C, with a CVE  |
 
@@ -543,9 +552,18 @@ Differences from the current format:
   vault is rejected with `CorruptedData` rather than silently losing an
   entry.
 
-Everything else (header, KDF chain, AAD bindings, per-entry encryption)
-is identical, which is why migration is a pure re-encoding: entry
-ciphertexts are carried over unchanged and no plaintext is touched. A
-version 2 file whose header is rewritten to claim version 1 fails the
-AEAD, since the header is the AAD, so the legacy path cannot be forced
-on a current file.
+* The master key was derived with Argon2i (the only variant `orion`
+  implements); version 2 uses Argon2id (section 4). Since every subkey
+  descends from the master key, a version 1 vault cannot simply be
+  re-encoded: after the index has authenticated, `open()` re-keys it the
+  way `change_password` does, with the same password, a fresh salt, and
+  Argon2id, re-encrypting each entry one at a time. This is the "option
+  B" case of section 11.1 handled as option A, which is acceptable here
+  because the whole migration happens in memory and nothing is written
+  until the caller saves: a failure leaves the file as it was. The price
+  is one extra derivation when a legacy file is opened.
+
+Header layout, AAD bindings, and per-entry encryption are otherwise
+identical. A version 2 file whose header is rewritten to claim version 1
+fails the AEAD, since the header is the AAD, so the legacy path (and its
+weaker KDF) cannot be forced on a current file.

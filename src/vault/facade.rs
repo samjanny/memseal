@@ -26,7 +26,7 @@ use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::constants::{
     LEGACY_VAULT_VERSION_1, MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MAX_HEADER_JSON_LEN,
     MAX_KDF_ITERATIONS, MAX_KDF_MEMORY, MAX_VAULT_FILE_SIZE, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY,
-    MIN_PASSWORD_LEN, SUPPORTED_VAULT_VERSIONS, VAULT_VERSION,
+    MIN_PASSWORD_LEN, SUPPORTED_VAULT_VERSIONS,
 };
 use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
 use crate::crypto::utils::secure_bytes_fill;
@@ -75,7 +75,7 @@ impl Vault {
     pub fn create(password: &[u8]) -> Result<Self, VaultError> {
         validate_password(password)?;
         let header = VaultHeader::generate()?;
-        let master_key = Zeroizing::new(derive_master_key(password, &header)?);
+        let master_key = derive_master_key(password, &header)?;
         let index = VaultIndex::from_master_key(master_key.as_slice(), &header.kdf_salt)?;
         Ok(Vault { header, index })
     }
@@ -89,8 +89,12 @@ impl Vault {
     ///
     /// Both the current format (version 2) and the format written by
     /// releases up to 0.2.1 (version 1) are accepted. A version 1 vault is
-    /// upgraded in memory; the next [`Vault::export`] or [`Vault::save`]
-    /// writes it in the current format.
+    /// upgraded in memory: its keys were derived with Argon2i, so the vault
+    /// is re-keyed with Argon2id under the same password (a second
+    /// derivation plus one re-encryption of every entry, exactly what
+    /// [`Vault::change_password`] does) and the next [`Vault::export`] or
+    /// [`Vault::save`] writes it in the current format. Nothing is written
+    /// until then.
     ///
     /// # Errors
     ///
@@ -103,13 +107,13 @@ impl Vault {
     /// index) return [`VaultError::CorruptedData`].
     pub fn open(password: &[u8], data: &[u8]) -> Result<Self, VaultError> {
         let envelope = parse_envelope(data)?;
-        let mut header = envelope.header;
+        let header = envelope.header;
 
         // Argon2 is the expensive step; everything above is cheap. The two
         // subkeys are derived exactly once and the master key is dropped
         // right away. Zeroizing wipes each buffer on every exit path,
         // including the early returns below.
-        let master_key = Zeroizing::new(derive_master_key(password, &header)?);
+        let master_key = derive_master_key(password, &header)?;
         let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt)?;
         let enc_sub = Zeroizing::new(enc_sub);
         let hmac_sub = Zeroizing::new(hmac_sub);
@@ -138,11 +142,15 @@ impl Vault {
             idx_data.files,
         )?;
 
-        // The in-memory vault is always current-format: a legacy file is
-        // rewritten as version 2 by the next export (DESIGN.md 11.1, option A).
-        header.version = VAULT_VERSION;
-
-        Ok(Vault { header, index })
+        let mut vault = Vault { header, index };
+        if vault.header.version == LEGACY_VAULT_VERSION_1 {
+            // Format 1 derived its keys with Argon2i. Re-key with the current
+            // KDF under the same password so the in-memory vault is always
+            // current-format and the next export writes version 2
+            // (DESIGN.md section 12).
+            vault.rekey(password)?;
+        }
+        Ok(vault)
     }
 
     /// Loads a vault from a file on disk.
@@ -434,9 +442,16 @@ impl Vault {
     ) -> Result<(), VaultError> {
         validate_password(new_password)?;
         self.verify_password(current_password)?;
+        self.rekey(new_password)
+    }
 
+    /// Derives fresh keys from `password` with a new header (current format
+    /// version, fresh salt) and re-encrypts every entry under them, one at a
+    /// time. `self` is replaced only once every entry has been re-encrypted;
+    /// any failure leaves it unchanged.
+    fn rekey(&mut self, password: &[u8]) -> Result<(), VaultError> {
         let new_header = VaultHeader::generate()?;
-        let new_master_key = Zeroizing::new(derive_master_key(new_password, &new_header)?);
+        let new_master_key = derive_master_key(password, &new_header)?;
         let new_index =
             VaultIndex::from_master_key(new_master_key.as_slice(), &new_header.kdf_salt)?;
         drop(new_master_key);
@@ -480,7 +495,7 @@ impl Vault {
     /// constant-time comparison of the derived encryption subkey with the
     /// stored one.
     fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
-        let master_key = Zeroizing::new(derive_master_key(password, &self.header)?);
+        let master_key = derive_master_key(password, &self.header)?;
         let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &self.header.kdf_salt)?;
         let enc_sub = Zeroizing::new(enc_sub);
         drop(Zeroizing::new(hmac_sub));
@@ -650,26 +665,48 @@ fn extract_enc_key(enc_secret: &LockedSecret) -> Result<Zeroizing<[u8; 32]>, Vau
     })
 }
 
-fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_LEN], VaultError> {
-    let mut master_key = [0u8; KEY_LEN];
-    argon2i::derive_key(
-        password,
-        &header.kdf_salt,
-        header.kdf_iterations,
-        header.kdf_memory_cost,
-        None,
-        None,
-        &mut master_key,
-    )
-    .map_err(|e| VaultError::CryptoError(format!("Argon2i derivation failed: {}", e)))?;
+/// Derives the master key from the password with the KDF of the header's
+/// format version: Argon2id for the current format, Argon2i for format
+/// version 1 (DESIGN.md sections 4 and 12). Both use the header's salt,
+/// memory cost, and pass count with a single lane.
+fn derive_master_key(
+    password: &[u8],
+    header: &VaultHeader,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+    if header.version == LEGACY_VAULT_VERSION_1 {
+        argon2i::derive_key(
+            password,
+            &header.kdf_salt,
+            header.kdf_iterations,
+            header.kdf_memory_cost,
+            None,
+            None,
+            master_key.as_mut_slice(),
+        )
+        .map_err(|e| VaultError::CryptoError(format!("Argon2i derivation failed: {}", e)))?;
+    } else {
+        let params = argon2::Params::new(
+            header.kdf_memory_cost,
+            header.kdf_iterations,
+            1,
+            Some(KEY_LEN),
+        )
+        .map_err(|e| VaultError::CryptoError(format!("Argon2id parameters: {}", e)))?;
+        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(password, &header.kdf_salt, master_key.as_mut_slice())
+            .map_err(|e| VaultError::CryptoError(format!("Argon2id derivation failed: {}", e)))?;
+    }
     Ok(master_key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::argon2;
-    use crate::vault::index_codec::{ENTRY_KEY_LEN, MAX_ENCRYPTED_NAME_LEN, MIN_ENCRYPTED_LEN};
+    use crate::constants::{VAULT_VERSION, argon2};
+    use crate::vault::index_codec::{
+        ENTRY_KEY_LEN, MAX_ENCRYPTED_NAME_LEN, MIN_ENCRYPTED_LEN, key_to_hex,
+    };
 
     #[test]
     fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
@@ -692,6 +729,31 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn derive_master_key_selects_kdf_by_format_version() {
+        // Same password, salt, and parameters: format 1 uses Argon2i,
+        // format 2 Argon2id, and the two must not agree.
+        let mut legacy = VaultHeader::new([7u8; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
+        legacy.version = LEGACY_VAULT_VERSION_1;
+        let current = VaultHeader::new([7u8; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
+        assert_eq!(current.version, VAULT_VERSION);
+        let k1 = derive_master_key(b"kdf-password", &legacy).unwrap();
+        let k2 = derive_master_key(b"kdf-password", &current).unwrap();
+        assert_ne!(*k1, *k2);
+    }
+
+    #[test]
+    fn derive_master_key_argon2id_known_answer() {
+        // Pins the Argon2id configuration (version 0x13, one lane, 32-byte
+        // output) so a silent parameter change breaks the test rather than
+        // every existing vault.
+        let header = VaultHeader::new([0x5A; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
+        let key = derive_master_key(b"known-answer-password", &header).unwrap();
+        assert_eq!(key_to_hex(key.as_slice()), ARGON2ID_KAT);
+    }
+
+    const ARGON2ID_KAT: &str = "99042566ff7a3da22162503ab2b2d089c071ec7b836c2eb1e395effde97bd229";
 
     #[test]
     fn create_and_export_open_roundtrip() {
@@ -1097,16 +1159,18 @@ mod tests {
 
         let mut vault = Vault::open(V1_PASSWORD, V1_FIXTURE).unwrap();
         assert_fixture_entries(&vault);
-        // The in-memory vault is upgraded: the next export writes version 2.
+        // The in-memory vault is upgraded and re-keyed with Argon2id under a
+        // fresh salt: the next export writes version 2.
         assert_eq!(vault.header.version, VAULT_VERSION);
+        assert_ne!(vault.header.kdf_salt, envelope.header.kdf_salt);
 
         let exported = vault.export().unwrap();
         assert_eq!(
             parse_envelope(&exported).unwrap().header.version,
             VAULT_VERSION
         );
-        // Entry ciphertexts are carried over unchanged, so the binary export
-        // is far smaller than the JSON original.
+        // Same secrets, binary index instead of JSON number arrays: far
+        // smaller than the original.
         assert!(exported.len() < V1_FIXTURE.len() / 2);
 
         let reopened = Vault::open(V1_PASSWORD, &exported).unwrap();
@@ -1568,7 +1632,7 @@ mod tests {
         use crate::vault::index_codec::tests::raw_encode;
 
         let header = VaultHeader::generate().unwrap();
-        let master_key = Zeroizing::new(derive_master_key(password, &header).unwrap());
+        let master_key = derive_master_key(password, &header).unwrap();
         let (enc_sub, _hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt).unwrap();
         let enc_sub = Zeroizing::new(enc_sub);
 
