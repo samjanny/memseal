@@ -44,7 +44,6 @@
 //! ```
 
 #![deny(unsafe_code)]
-#![allow(dead_code)]
 
 mod constants;
 mod crypto;

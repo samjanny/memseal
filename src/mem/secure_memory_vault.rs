@@ -8,7 +8,6 @@
 //! key that decrypts the buffer gets the same protection as the buffer.
 use crate::constants::SECURE_MEMORY_VAULT_CHUNK_SIZE;
 use crate::crypto::utils::secure_bytes_fill;
-use crate::mem::secure_memory_vault::MemoryVaultError::GenericError;
 use memsec::{mlock, munlock};
 use orion::hazardous::aead::streaming::{ABYTES, StreamTag, StreamXChaCha20Poly1305};
 use orion::hazardous::stream::chacha20::{CHACHA_KEYSIZE, SecretKey};
@@ -35,9 +34,6 @@ pub enum MemoryVaultError {
     /// Error when locking memory using `mlock`.
     #[error("memsec lock failed")]
     Lock,
-    /// Error when unlocking memory using `munlock`.
-    #[error("memsec unlock failed")]
-    Unlock,
     /// Error when acquiring a mutex lock.
     #[error("mutex lock failed")]
     MutexLockFailed,
@@ -150,17 +146,6 @@ impl SecureMemoryVault {
         Ok(())
     }
 
-    /// Creates a vault from a closure that produces key material, zeroizing it after encryption.
-    pub fn safe_new<F, const N: usize>(f: F) -> Result<Self, MemoryVaultError>
-    where
-        F: FnOnce() -> Result<[u8; N], &'static str>,
-    {
-        let mut key = f().map_err(|e| GenericError(e.to_string()))?;
-        let result = Self::new(&key);
-        key.zeroize();
-        result
-    }
-
     /// Decrypts the data and passes each chunk to `f`.
     ///
     /// The plaintext scratch buffer is wrapped in `Zeroizing`, so it is wiped
@@ -206,16 +191,6 @@ impl SecureMemoryVault {
     /// Returns `true` if the region holding key, nonce, and ciphertext is currently mlock'd.
     pub fn is_locked(&self) -> bool {
         self.is_locked.load(Ordering::SeqCst)
-    }
-
-    /// Returns the length of the original plaintext in bytes.
-    pub fn len(&self) -> usize {
-        self.plaintext_len
-    }
-
-    /// Returns `true` if the vault holds no plaintext data.
-    pub fn is_empty(&self) -> bool {
-        self.plaintext_len == 0
     }
 }
 
@@ -370,10 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn test_len() {
+    fn test_plaintext_len_matches_input() {
         let data = b"1234567890";
         let vault = SecureMemoryVault::new(data).unwrap();
-        assert_eq!(vault.len(), data.len());
+        assert_eq!(vault.plaintext_len, data.len());
     }
 
     #[test]
@@ -388,7 +363,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(buf, data);
-        assert_eq!(vault.len(), 0);
+        assert_eq!(vault.plaintext_len, 0);
     }
 
     #[test]
@@ -407,15 +382,5 @@ mod tests {
         let res = encr.seal_chunk(pt, None, &mut ct, &tag);
         println!("seal_chunk result: {:?}", res);
         assert!(res.is_ok());
-    }
-
-    #[test]
-    fn test_safe_new_success() {
-        let vault = SecureMemoryVault::safe_new(|| {
-            // Generate a valid key
-            Ok([1u8; 32])
-        });
-
-        assert!(vault.is_ok());
     }
 }

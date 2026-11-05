@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+* Removed internal code that no `Vault` operation used: the bounded random integer helpers, the `SecureConstructor`/`SecureAccess` traits with their `EncryptionError`, the `NonceRotation` type-state on `VaultIndex`, `VaultIndex::generate`, `from_master_key_and_data`, `generate_dummy`, the unused `kdf_salt` copy held by the index, and `SecureMemoryVault::{safe_new, len, is_empty}`. The `secrecy` dependency went with the traits. The crate-level `#![allow(dead_code)]` is gone, so unused items now fail the clippy job in CI. The public API is unchanged.
+
 ## [0.2.1] - 2026-09-10
 
 ### Security

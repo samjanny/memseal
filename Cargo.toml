@@ -17,7 +17,6 @@ path = "src/lib.rs"
 
 
 [dependencies]
-secrecy = "^0.10"
 zeroize = { version = "^1.8", features = ["derive"] }
 rand_core = { version = "0.9.3", features = ["os_rng"] }
 memsec = "0.7.0"

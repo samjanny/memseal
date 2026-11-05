@@ -75,7 +75,7 @@ const MAX_ENCRYPTED_NAME_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_NAME_LEN +
 /// ```
 pub struct Vault {
     header: VaultHeader,
-    index: VaultIndex<crate::crypto::nonce_rotation::NonceNotRotated>,
+    index: VaultIndex,
 }
 
 impl Vault {
@@ -206,7 +206,6 @@ impl Vault {
         let index = VaultIndex::from_subkeys_and_data(
             &enc_sub,
             &hmac_sub,
-            &header.kdf_salt,
             idx_data.nonce,
             idx_data.nonce_counter,
             idx_data.data_nonce_counter,
