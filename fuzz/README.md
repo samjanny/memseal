@@ -18,13 +18,17 @@ oracle here.
 
 ```bash
 cargo install cargo-fuzz
-cargo +nightly fuzz run parse_envelope fuzz/seeds/parse_envelope -- -max_total_time=300
-cargo +nightly fuzz run decode_index fuzz/seeds/decode_index -- -max_total_time=300
-cargo +nightly fuzz run decode_index_v1 fuzz/seeds/decode_index_v1 -- -max_total_time=300
+for t in parse_envelope decode_index decode_index_v1; do
+  mkdir -p fuzz/corpus/$t
+  cargo +nightly fuzz run $t fuzz/corpus/$t fuzz/seeds/$t -- -max_total_time=300
+done
 ```
 
-`fuzz/seeds/` holds one valid input per target (a format 1 and a format 2
-vault for the envelope, a matching plaintext index for each decoder) so
-the fuzzer starts from the accepting path instead of discovering the
-layout from scratch. Crashes land in `fuzz/artifacts/<target>/`; add the
-input to `fuzz/seeds/<target>/` once fixed so it stays a regression test.
+libFuzzer writes every new input it keeps into the first corpus directory
+it is given, so pass the working corpus (`fuzz/corpus/<target>`, ignored
+by git) first and the seeds second. `fuzz/seeds/` holds one valid input
+per target (a format 1 and a format 2 vault for the envelope, a matching
+plaintext index for each decoder) so the fuzzer starts from the accepting
+path instead of discovering the layout from scratch. Crashes land in
+`fuzz/artifacts/<target>/`; add the input to `fuzz/seeds/<target>/` once
+fixed so it stays a regression test.

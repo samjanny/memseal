@@ -386,7 +386,8 @@ Fuzz the untrusted-input parsers (nightly toolchain and `cargo-fuzz`):
 
 ```bash
 cargo install cargo-fuzz
-cargo +nightly fuzz run parse_envelope fuzz/seeds/parse_envelope -- -max_total_time=300
+mkdir -p fuzz/corpus/parse_envelope
+cargo +nightly fuzz run parse_envelope fuzz/corpus/parse_envelope fuzz/seeds/parse_envelope -- -max_total_time=300
 ```
 
 The targets (`parse_envelope`, `decode_index`, `decode_index_v1`) call the
