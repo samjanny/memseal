@@ -389,7 +389,9 @@ GitHub Actions runs on every push and PR to `main`:
 
 ## MSRV
 
-`memseal` currently targets the Rust stable toolchain and uses the Rust 2024 edition.
+`memseal` uses the Rust 2024 edition and declares `rust-version = "1.88"`
+in `Cargo.toml`, the first release with let chains. CI checks the crate
+builds on that toolchain.
 
 ## Security
 

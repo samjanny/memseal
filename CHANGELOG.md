@@ -20,6 +20,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 * `change_password` verifies the current password by deriving its subkeys with the current header and comparing the encryption subkey with the one in memory in constant time, instead of exporting the whole vault and reopening it. The cost is still one Argon2i derivation, but a wrong password no longer serializes and authenticates the full index, and it no longer advances the index nonce counter: the vault is left exactly as it was. The re-encryption loop reads the old ciphertexts in place instead of cloning every entry first.
 * Removed internal code that no `Vault` operation used: the bounded random integer helpers, the `SecureConstructor`/`SecureAccess` traits with their `EncryptionError`, the `NonceRotation` type-state on `VaultIndex`, `VaultIndex::generate`, `from_master_key_and_data`, `generate_dummy`, the unused `kdf_salt` copy held by the index, and `SecureMemoryVault::{safe_new, len, is_empty}`. The `secrecy` dependency went with the traits. The crate-level `#![allow(dead_code)]` is gone, so unused items now fail the clippy job in CI. The public API is unchanged.
 
+* `Vault::open` is split into a pure, cheap `parse_envelope` step (length fields, header JSON, KDF parameter bounds) and a `decode_index` step for the authenticated index, with the Argon2 derivation and AEAD in between. Both pieces have direct tests and the first is the intended target for fuzzing the untrusted-input parser without paying for Argon2 on every input.
+* `Cargo.toml` declares `rust-version = "1.88"` (let chains), and CI gains an MSRV job that checks the crate on that toolchain.
+* Tests that write vault files use `tempfile` directories instead of fixed names in the system temp directory.
+
 ### Fixed
 
 * The `Vault::store` benchmark used a fresh entry name on every iteration and panicked once it crossed `MAX_INDEX_ENTRIES`; it now cycles through 1000 names.

@@ -62,8 +62,8 @@ const MAX_ENCRYPTED_NAME_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_NAME_LEN +
 /// let mut vault = Vault::create(b"password1234").unwrap();
 /// vault.store("db_url", b"postgres://localhost/mydb").unwrap();
 ///
-/// # let dir = std::env::temp_dir();
-/// # let path = dir.join("test_vault_doc2.seal");
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("vault.seal");
 /// vault.save(&path).unwrap();
 ///
 /// let loaded = Vault::load(&path, b"password1234").unwrap();
@@ -71,7 +71,6 @@ const MAX_ENCRYPTED_NAME_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_NAME_LEN +
 ///     loaded.retrieve("db_url").unwrap(),
 ///     Some(b"postgres://localhost/mydb".to_vec())
 /// );
-/// # std::fs::remove_file(&path).ok();
 /// ```
 pub struct Vault {
     header: VaultHeader,
@@ -107,43 +106,8 @@ impl Vault {
     /// fields, malformed header, out-of-range parameters, an inconsistent
     /// index) return [`VaultError::CorruptedData`].
     pub fn open(password: &[u8], data: &[u8]) -> Result<Self, VaultError> {
-        if data.len() < 4 {
-            return Err(VaultError::CorruptedData("Data too short".to_string()));
-        }
-
-        let header_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-
-        // The header is plaintext and is parsed before anything has been
-        // authenticated, so it gets its own tight bound rather than the
-        // 256 MiB file cap. This also rules out any offset overflow below.
-        if header_len > MAX_HEADER_JSON_LEN {
-            return Err(VaultError::CorruptedData(format!(
-                "Header length {} exceeds maximum {}",
-                header_len, MAX_HEADER_JSON_LEN
-            )));
-        }
-
-        let after_header = 4 + header_len;
-        let min_total = after_header + XCHACHA20_NONCE_LEN + 8;
-
-        if data.len() < min_total {
-            return Err(VaultError::CorruptedData(
-                "Data too short for nonce and counter".to_string(),
-            ));
-        }
-
-        let header: VaultHeader = serde_json::from_slice(&data[4..after_header])
-            .map_err(|e| VaultError::CorruptedData(format!("Invalid header JSON: {}", e)))?;
-
-        validate_header(&header)?;
-
-        let nonce: [u8; XCHACHA20_NONCE_LEN] = data
-            [after_header..after_header + XCHACHA20_NONCE_LEN]
-            .try_into()
-            .unwrap();
-
-        let counter_start = after_header + XCHACHA20_NONCE_LEN;
-        let encrypted_index = &data[counter_start + 8..];
+        let envelope = parse_envelope(data)?;
+        let header = envelope.header;
 
         // Argon2 is the expensive step; everything above is cheap. The two
         // subkeys are derived exactly once and the master key is dropped
@@ -159,41 +123,11 @@ impl Vault {
         // The decrypted index (HMAC entry names, nonce counters, structural
         // metadata) is cleared on scope exit as well.
         let index_json = Zeroizing::new(
-            open_with_aad(&enc_sub, &nonce, encrypted_index, &aad)
+            open_with_aad(&enc_sub, &envelope.nonce, envelope.encrypted_index, &aad)
                 .map_err(|_| VaultError::InvalidPassword)?,
         );
 
-        #[derive(serde::Deserialize)]
-        struct IndexData {
-            version: u16,
-            nonce: [u8; XCHACHA20_NONCE_LEN],
-            nonce_counter: u64,
-            data_nonce_counter: u64,
-            files: HashMap<String, IndexMetaBlockMetadata>,
-        }
-
-        let idx_data: IndexData = serde_json::from_slice(&index_json)
-            .map_err(|e| VaultError::CorruptedData(format!("Invalid index JSON: {}", e)))?;
-
-        if !crate::constants::vault_index_constants::SUPPORTED_VAULT_INDEX_VERSIONS
-            .contains(&idx_data.version)
-        {
-            return Err(VaultError::CorruptedData(format!(
-                "Unsupported index version: {}",
-                idx_data.version
-            )));
-        }
-
-        let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
-        if idx_data.files.len() > max_index_entries {
-            return Err(VaultError::CorruptedData(format!(
-                "Index entry count {} exceeds maximum {}",
-                idx_data.files.len(),
-                max_index_entries
-            )));
-        }
-
-        validate_entry_sizes(&idx_data.files)?;
+        let idx_data = decode_index(&index_json)?;
 
         let index = VaultIndex::from_subkeys_and_data(
             &enc_sub,
@@ -610,6 +544,104 @@ impl Vault {
     }
 }
 
+/// The plaintext envelope of a vault file (DESIGN.md section 2), parsed and
+/// bounds-checked but not yet authenticated. Everything in it is
+/// attacker-controlled until `encrypted_index` verifies under the key
+/// derived from `header`.
+struct Envelope<'a> {
+    header: VaultHeader,
+    nonce: [u8; XCHACHA20_NONCE_LEN],
+    encrypted_index: &'a [u8],
+}
+
+/// Steps 1-5 of DESIGN.md section 2.1: the part of `open` that runs before
+/// any key derivation. It is pure and cheap, which is what makes it the
+/// right target for fuzzing the untrusted-input parser without paying for
+/// Argon2 on every input.
+fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
+    if data.len() < 4 {
+        return Err(VaultError::CorruptedData("Data too short".to_string()));
+    }
+
+    let header_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+
+    // The header is plaintext and is parsed before anything has been
+    // authenticated, so it gets its own tight bound rather than the
+    // 256 MiB file cap. This also rules out any offset overflow below.
+    if header_len > MAX_HEADER_JSON_LEN {
+        return Err(VaultError::CorruptedData(format!(
+            "Header length {} exceeds maximum {}",
+            header_len, MAX_HEADER_JSON_LEN
+        )));
+    }
+
+    let after_header = 4 + header_len;
+    let min_total = after_header + XCHACHA20_NONCE_LEN + 8;
+
+    if data.len() < min_total {
+        return Err(VaultError::CorruptedData(
+            "Data too short for nonce and counter".to_string(),
+        ));
+    }
+
+    let header: VaultHeader = serde_json::from_slice(&data[4..after_header])
+        .map_err(|e| VaultError::CorruptedData(format!("Invalid header JSON: {}", e)))?;
+
+    validate_header(&header)?;
+
+    let nonce: [u8; XCHACHA20_NONCE_LEN] = data[after_header..after_header + XCHACHA20_NONCE_LEN]
+        .try_into()
+        .unwrap();
+
+    // The 8-byte counter after the nonce is not read (DESIGN.md 9.1).
+    let counter_start = after_header + XCHACHA20_NONCE_LEN;
+    let encrypted_index = &data[counter_start + 8..];
+
+    Ok(Envelope {
+        header,
+        nonce,
+        encrypted_index,
+    })
+}
+
+/// The decrypted index JSON, in the shape `export` writes it.
+#[derive(serde::Deserialize)]
+struct IndexData {
+    version: u16,
+    nonce: [u8; XCHACHA20_NONCE_LEN],
+    nonce_counter: u64,
+    data_nonce_counter: u64,
+    files: HashMap<String, IndexMetaBlockMetadata>,
+}
+
+/// Step 7 of DESIGN.md section 2.1: decodes an index that has already been
+/// authenticated and checks it against the format bounds.
+fn decode_index(index_json: &[u8]) -> Result<IndexData, VaultError> {
+    let idx_data: IndexData = serde_json::from_slice(index_json)
+        .map_err(|e| VaultError::CorruptedData(format!("Invalid index JSON: {}", e)))?;
+
+    if !crate::constants::vault_index_constants::SUPPORTED_VAULT_INDEX_VERSIONS
+        .contains(&idx_data.version)
+    {
+        return Err(VaultError::CorruptedData(format!(
+            "Unsupported index version: {}",
+            idx_data.version
+        )));
+    }
+
+    let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+    if idx_data.files.len() > max_index_entries {
+        return Err(VaultError::CorruptedData(format!(
+            "Index entry count {} exceeds maximum {}",
+            idx_data.files.len(),
+            max_index_entries
+        )));
+    }
+
+    validate_entry_sizes(&idx_data.files)?;
+    Ok(idx_data)
+}
+
 fn validate_password(password: &[u8]) -> Result<(), VaultError> {
     if password.len() < MIN_PASSWORD_LEN {
         return Err(VaultError::InvalidInput(format!(
@@ -912,8 +944,8 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("memseal_test_save_load2.seal");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.seal");
 
         let mut vault = Vault::create(b"file-password").unwrap();
         vault.store("secret", b"file-stored-value").unwrap();
@@ -924,14 +956,12 @@ mod tests {
             loaded.retrieve("secret").unwrap(),
             Some(b"file-stored-value".to_vec())
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn load_wrong_password_fails() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("memseal_test_wrong_pw2.seal");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.seal");
 
         let mut vault = Vault::create(b"correct!").unwrap();
         vault.save(&path).unwrap();
@@ -940,8 +970,6 @@ mod tests {
             Vault::load(&path, b"wrong!!!"),
             Err(VaultError::InvalidPassword)
         ));
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1108,6 +1136,81 @@ mod tests {
         let mut data = vec![0u8; 100];
         data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(Vault::open(b"password", &data).is_err());
+    }
+
+    // Direct tests of the pre-authentication parser and the index decoder.
+    // Both run without Argon2, so they are cheap; the end-to-end variants
+    // below exercise the same checks through open().
+
+    #[test]
+    fn parse_envelope_splits_a_valid_export() {
+        let mut vault = Vault::create(b"password-env").unwrap();
+        vault.store("k", b"v").unwrap();
+        let data = vault.export().unwrap();
+
+        let envelope = parse_envelope(&data).unwrap();
+        assert_eq!(
+            envelope.header.to_aad_bytes().unwrap(),
+            vault.header.to_aad_bytes().unwrap()
+        );
+        assert_eq!(envelope.nonce, vault.index.nonce);
+        let header_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            envelope.encrypted_index.len(),
+            data.len() - (4 + header_len + XCHACHA20_NONCE_LEN + 8)
+        );
+    }
+
+    #[test]
+    fn decode_index_rejects_wrong_version_and_malformed_json() {
+        let nonce = vec![0u8; XCHACHA20_NONCE_LEN];
+        let json = serde_json::json!({
+            "version": 999,
+            "nonce": nonce,
+            "nonce_counter": 0u64,
+            "data_nonce_counter": 0u64,
+            "files": {},
+        });
+        match decode_index(&serde_json::to_vec(&json).unwrap()) {
+            Err(VaultError::CorruptedData(msg)) => assert!(msg.contains("version"), "{}", msg),
+            other => panic!("unexpected: {:?}", other.map(|_| ())),
+        }
+        assert!(matches!(
+            decode_index(b"{not json"),
+            Err(VaultError::CorruptedData(_))
+        ));
+    }
+
+    #[test]
+    fn decode_index_rejects_entry_count_over_cap() {
+        let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+        let mut files = serde_json::Map::new();
+        for i in 0..=max {
+            files.insert(
+                format!("{:064x}", i),
+                serde_json::json!({
+                    "location": "Inline",
+                    "created": 0,
+                    "modified": 0,
+                    "is_dummy": true,
+                    "encrypted_data": null,
+                    "encrypted_name": null,
+                    "data_counter": 0,
+                }),
+            );
+        }
+        let nonce = vec![0u8; XCHACHA20_NONCE_LEN];
+        let json = serde_json::json!({
+            "version": crate::constants::vault_index_constants::VAULT_INDEX_VERSION,
+            "nonce": nonce,
+            "nonce_counter": 0u64,
+            "data_nonce_counter": 1u64,
+            "files": files,
+        });
+        assert!(matches!(
+            decode_index(&serde_json::to_vec(&json).unwrap()),
+            Err(VaultError::CorruptedData(_))
+        ));
     }
 
     // Tampering group A: raw-bytes truncation and boundary checks.
