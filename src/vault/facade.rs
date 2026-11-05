@@ -538,134 +538,117 @@ impl Vault {
 
     /// Changes the vault's password.
     ///
-    /// Re-derives all keys from the new password and re-encrypts every entry
-    /// one at a time (at most one plaintext in memory at any given time).
+    /// `current_password` is verified by deriving its subkeys with the
+    /// current header and comparing the encryption subkey with the one in
+    /// memory in constant time; this costs one Argon2i derivation and has no
+    /// side effects. Returns [`VaultError::InvalidPassword`] on a mismatch
+    /// and leaves the vault untouched.
     ///
-    /// The current password is verified by exporting and re-opening the
-    /// vault, which runs the Argon2 derivation for the current password
-    /// before the new one is derived and advances the index nonce counter
-    /// even when verification fails. Returns [`VaultError::InvalidPassword`]
-    /// if `current_password` does not authenticate the vault; the vault is
-    /// then left unchanged apart from that counter and stays fully usable.
+    /// On success, every entry is decrypted and re-encrypted one at a time
+    /// under keys derived from `new_password` with a fresh salt (at most one
+    /// plaintext in memory at any given time). The vault is only replaced
+    /// once every entry has been re-encrypted; any failure leaves it
+    /// unchanged and fully usable.
     pub fn change_password(
         &mut self,
         current_password: &[u8],
         new_password: &[u8],
     ) -> Result<(), VaultError> {
         validate_password(new_password)?;
-
-        // Verify current password by exporting and re-opening.
-        // Note: export() advances the nonce counter on self. If the password
-        // check fails, self has a different nonce but is otherwise unchanged
-        // and fully functional. This is acceptable because the nonce counter
-        // is monotonic and the vault data is intact. Zeroizing wipes the
-        // exported copy on the error path as well.
-        let exported = Zeroizing::new(self.export()?);
-        let _ = Vault::open(current_password, &exported)?;
-        drop(exported);
+        self.verify_password(current_password)?;
 
         let new_header = VaultHeader::generate()?;
-        let mut new_master_key = derive_master_key(new_password, &new_header)?;
-
-        // Collect encrypted entries with HMAC'd keys and data_counter for AAD
-        type OldEntry = (String, u64, bool, Option<Vec<u8>>, Option<Vec<u8>>);
-        let old_entries: Vec<OldEntry> = self
-            .index
-            .files
-            .iter()
-            .map(|(k, m)| {
-                (
-                    k.clone(),
-                    m.data_counter,
-                    m.is_dummy,
-                    m.encrypted_name.clone(),
-                    m.encrypted_data.clone(),
-                )
-            })
-            .collect();
-
-        let old_enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let old_enc_key = extract_enc_key(old_enc_secret).inspect_err(|_| {
-            new_master_key.zeroize();
-        })?;
-
-        // Build the new index; the master key is wiped on every path and
-        // `old_enc_key` wipes itself on drop.
-        let new_index_result = VaultIndex::from_master_key(&new_master_key, &new_header.kdf_salt)
-            .map_err(|e| VaultError::CryptoError(e.to_string()));
-        new_master_key.zeroize();
-        let new_index = new_index_result?;
+        let new_master_key = Zeroizing::new(derive_master_key(new_password, &new_header)?);
+        let new_index =
+            VaultIndex::from_master_key(new_master_key.as_slice(), &new_header.kdf_salt)
+                .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        drop(new_master_key);
 
         let mut new_vault = Vault {
             header: new_header,
             index: new_index,
         };
 
-        // Re-encrypt entries one at a time into new_vault
-        let loop_result = (|| -> Result<(), VaultError> {
-            for (old_hmac_key, old_counter, is_dummy, enc_name_opt, enc_data_opt) in &old_entries {
-                // Dummy padding entries carry no payload; they are dropped on
-                // password change rather than re-encrypted.
-                if *is_dummy {
-                    continue;
-                }
+        let old_enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let old_enc_key = extract_enc_key(old_enc_secret)?;
 
-                // A real entry always stores both ciphertexts; a missing or
-                // undersized field means the (authenticated) index is
-                // inconsistent. Fail instead of silently dropping the entry.
-                let old_aad = build_entry_aad(old_hmac_key, *old_counter);
-
-                let mut plaintext_name = match enc_name_opt {
-                    Some(enc_name) if enc_name.len() >= XCHACHA20_NONCE_LEN => {
-                        let nonce: [u8; XCHACHA20_NONCE_LEN] =
-                            enc_name[..XCHACHA20_NONCE_LEN].try_into().unwrap();
-                        let ct = &enc_name[XCHACHA20_NONCE_LEN..];
-                        let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)
-                            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-                        String::from_utf8(name_bytes).map_err(|e| {
-                            let mut bytes = e.into_bytes();
-                            bytes.zeroize();
-                            VaultError::CorruptedData("Invalid entry name".to_string())
-                        })?
-                    }
-                    _ => {
-                        return Err(VaultError::CorruptedData(
-                            "Entry is missing a valid encrypted name".to_string(),
-                        ));
-                    }
-                };
-
-                let encrypted = match enc_data_opt {
-                    Some(enc) if enc.len() >= XCHACHA20_NONCE_LEN => enc,
-                    _ => {
-                        plaintext_name.zeroize();
-                        return Err(VaultError::CorruptedData(
-                            "Entry is missing valid encrypted data".to_string(),
-                        ));
-                    }
-                };
-
-                let nonce: [u8; XCHACHA20_NONCE_LEN] =
-                    encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
-                let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
-                let mut plaintext = open_with_aad(&old_enc_key, &nonce, ciphertext, &old_aad)
-                    .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
-                let store_result = new_vault.store(&plaintext_name, &plaintext);
-                plaintext.zeroize();
-                plaintext_name.zeroize();
-                store_result?;
+        // Re-encrypt entries one at a time into new_vault, reading the old
+        // ciphertexts in place.
+        for (old_hmac_key, meta) in &self.index.files {
+            // Dummy padding entries carry no payload; they are dropped on
+            // password change rather than re-encrypted.
+            if meta.is_dummy {
+                continue;
             }
-            Ok(())
-        })();
+
+            // A real entry always stores both ciphertexts; a missing or
+            // undersized field means the (authenticated) index is
+            // inconsistent. Fail instead of silently dropping the entry.
+            let old_aad = build_entry_aad(old_hmac_key, meta.data_counter);
+
+            let plaintext_name = match &meta.encrypted_name {
+                Some(enc_name) if enc_name.len() >= XCHACHA20_NONCE_LEN => {
+                    let nonce: [u8; XCHACHA20_NONCE_LEN] =
+                        enc_name[..XCHACHA20_NONCE_LEN].try_into().unwrap();
+                    let ct = &enc_name[XCHACHA20_NONCE_LEN..];
+                    let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)
+                        .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+                    Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
+                        let mut bytes = e.into_bytes();
+                        bytes.zeroize();
+                        VaultError::CorruptedData("Invalid entry name".to_string())
+                    })?)
+                }
+                _ => {
+                    return Err(VaultError::CorruptedData(
+                        "Entry is missing a valid encrypted name".to_string(),
+                    ));
+                }
+            };
+
+            let encrypted = match &meta.encrypted_data {
+                Some(enc) if enc.len() >= XCHACHA20_NONCE_LEN => enc,
+                _ => {
+                    return Err(VaultError::CorruptedData(
+                        "Entry is missing valid encrypted data".to_string(),
+                    ));
+                }
+            };
+
+            let nonce: [u8; XCHACHA20_NONCE_LEN] =
+                encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
+            let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
+            let plaintext = Zeroizing::new(
+                open_with_aad(&old_enc_key, &nonce, ciphertext, &old_aad)
+                    .map_err(|e| VaultError::CryptoError(e.to_string()))?,
+            );
+
+            new_vault.store(&plaintext_name, &plaintext)?;
+        }
         drop(old_enc_key);
 
-        // Only swap on full success - on error, self retains old keys/data
-        // (nonce counter may have advanced from the export() verification above)
-        loop_result?;
+        // Only swap on full success; on error, self retains old keys and data.
         self.header = new_vault.header;
         self.index = new_vault.index;
         Ok(())
+    }
+
+    /// Checks `password` against the keys in memory without touching the
+    /// vault: one Argon2i derivation with the current header, then a
+    /// constant-time comparison of the derived encryption subkey with the
+    /// stored one.
+    fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
+        let master_key = Zeroizing::new(derive_master_key(password, &self.header)?);
+        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &self.header.kdf_salt)
+            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let enc_sub = Zeroizing::new(enc_sub);
+        drop(Zeroizing::new(hmac_sub));
+        drop(master_key);
+
+        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        enc_secret
+            .with_bytes(|stored| orion::util::secure_cmp(stored, enc_sub.as_slice()))
+            .map_err(|_| VaultError::InvalidPassword)
     }
 }
 
@@ -1024,9 +1007,34 @@ mod tests {
     }
 
     #[test]
-    fn change_password_wrong_current_fails() {
+    fn change_password_wrong_current_fails_without_side_effects() {
         let mut vault = Vault::create(b"real-pwd!").unwrap();
-        assert!(vault.change_password(b"wrong!!!", b"new-pwd!").is_err());
+        vault.store("key", b"value").unwrap();
+        let nonce_before = vault.index.nonce;
+        let counter_before = vault.index.nonce_counter;
+
+        assert!(matches!(
+            vault.change_password(b"wrong!!!", b"new-pwd!"),
+            Err(VaultError::InvalidPassword)
+        ));
+
+        // The vault is untouched: same keys, same nonce state, entries
+        // still readable, and the old password still opens an export.
+        assert_eq!(vault.index.nonce, nonce_before);
+        assert_eq!(vault.index.nonce_counter, counter_before);
+        assert_eq!(vault.retrieve("key").unwrap(), Some(b"value".to_vec()));
+        let exported = vault.export().unwrap();
+        assert!(Vault::open(b"real-pwd!", &exported).is_ok());
+    }
+
+    #[test]
+    fn change_password_rejects_short_new_password() {
+        let mut vault = Vault::create(b"real-pwd!").unwrap();
+        assert!(matches!(
+            vault.change_password(b"real-pwd!", b"short"),
+            Err(VaultError::CryptoError(_))
+        ));
+        assert_eq!(vault.index.nonce_counter, 0);
     }
 
     #[test]
