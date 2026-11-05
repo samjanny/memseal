@@ -24,6 +24,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 * The `Vault::store` benchmark used a fresh entry name on every iteration and panicked once it crossed `MAX_INDEX_ENTRIES`; it now cycles through 1000 names.
 
+### Dependencies
+
+* `orion` is raised to 0.17.16 (minimum in `Cargo.toml` and in `Cargo.lock`) for RUSTSEC-2026-0426 and RUSTSEC-2026-0428. Neither advisory reaches memseal, which uses none of the ML-KEM, ML-DSA, or BLAKE2b code they concern, but the audit job fails on the vulnerable version.
+
 ## [0.2.1] - 2026-09-10
 
 ### Security
