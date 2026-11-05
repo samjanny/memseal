@@ -81,8 +81,8 @@ Failures at steps 1-5 return `VaultError::CorruptedData(...)`. Failure at
 step 6 returns `VaultError::InvalidPassword`: the AEAD does not
 distinguish "wrong key" from "tampered ciphertext or AAD" by design, so
 the variant means "authentication failed", not "the password was
-mistyped". Failure at step 7 returns `VaultError::CorruptedData(...)` and
-failure at step 8 returns `VaultError::CryptoError(...)`.
+mistyped". Failures at steps 7 and 8 return
+`VaultError::CorruptedData(...)`.
 
 
 ## 3. Header (`VaultHeader`)

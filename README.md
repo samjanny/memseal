@@ -153,11 +153,11 @@ fn main() {
 | Variant | Meaning |
 |---------|---------|
 | `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault. |
-| `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, index version, entry count, entry sizes). |
-| `CryptoError(String)` | A cryptographic operation failed, or an input violated a limit (password, entry name, entry data). |
+| `InvalidInput(String)` | An argument violated a documented limit: password shorter than 8 bytes, entry name over 255 bytes, entry data over 64 MiB, or a new name when the vault already holds 1024 entries. |
+| `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, index version, entry count, entry sizes), or the authenticated index is internally inconsistent. |
+| `CryptoError(String)` | A cryptographic or random-number operation failed, or locked memory for the subkeys could not be allocated. |
 | `SerializationError(String)` | Serializing the vault failed, or the export exceeds 256 MiB. |
 | `IoError(std::io::Error)` | A file operation in `load()` or `save()` failed. |
-| `InvalidKey` | The in-memory encryption subkey is unavailable (internal invariant). |
 
 A missing entry is not an error: `retrieve()` and `with_secret()` return
 `Ok(None)`, and `remove()` returns `Ok(false)`.
@@ -166,6 +166,10 @@ Upgrading from 0.1.x or 0.2.0: the variants `InvalidHeader`, `InvalidIndex`,
 `InvalidDataBlock`, `InvalidMetaBlock`, `InvalidPath`, `InvalidVersion`,
 `InvalidFormat`, and `EntryNotFound` were removed in 0.2.1. None of them was
 ever returned, so only exhaustive `match` expressions need to change.
+Upgrading from 0.2.1: `InvalidKey` is removed (it could not be returned
+either), limit violations now surface as `InvalidInput` instead of
+`CryptoError`, and an inconsistent counter in an otherwise authenticated
+index is reported by `open()` as `CorruptedData` instead of `CryptoError`.
 
 ## Handling Plaintext
 

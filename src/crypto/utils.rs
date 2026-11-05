@@ -1,25 +1,24 @@
 use rand_core::{OsRng, TryRngCore};
+use thiserror::Error;
+
+/// Error from the OS random number generator.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct RandomError(&'static str);
 
 /// Fills a buffer with cryptographically secure random bytes.
-///
-/// # Arguments
-/// - `buffer`: A mutable slice of bytes to be filled with random data.
-///
-/// # Returns
-/// - `Ok(())`: If the buffer is successfully filled with random bytes.
-/// - `Err(&'static str)`: An error message if the buffer is empty or random generation fails.
 ///
 /// # Errors
 /// - Returns an error if the buffer is empty.
 /// - Returns an error if the random number generation fails.
-pub fn secure_bytes_fill(buffer: &mut [u8]) -> Result<(), &'static str> {
+pub fn secure_bytes_fill(buffer: &mut [u8]) -> Result<(), RandomError> {
     if buffer.is_empty() {
-        return Err("Buffer is empty");
+        return Err(RandomError("Buffer is empty"));
     }
 
     OsRng
         .try_fill_bytes(buffer)
-        .map_err(|_| "Failed to fill buffer with random bytes")?;
+        .map_err(|_| RandomError("Failed to fill buffer with random bytes"))?;
     Ok(())
 }
 

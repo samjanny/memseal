@@ -44,8 +44,7 @@ impl VaultHeader {
     /// Generates a new header with a random salt and default Argon2i parameters.
     pub fn generate() -> Result<Self, VaultError> {
         let mut kdf_salt = [0; SALT_LEN];
-        secure_bytes_fill(&mut kdf_salt)
-            .map_err(|e| VaultError::CryptoError(format!("Failed to fill secure bytes: {}", e)))?;
+        secure_bytes_fill(&mut kdf_salt)?;
         Ok(VaultHeader::new(
             kdf_salt,
             argon2::ITERATIONS,

@@ -85,16 +85,9 @@ impl Vault {
     pub fn create(password: &[u8]) -> Result<Self, VaultError> {
         validate_password(password)?;
         let header = VaultHeader::generate()?;
-        let mut master_key = derive_master_key(password, &header)?;
-
-        let result = VaultIndex::from_master_key(&master_key, &header.kdf_salt)
-            .map_err(|e| VaultError::CryptoError(e.to_string()));
-
-        master_key.zeroize();
-        Ok(Vault {
-            header,
-            index: result?,
-        })
+        let master_key = Zeroizing::new(derive_master_key(password, &header)?);
+        let index = VaultIndex::from_master_key(master_key.as_slice(), &header.kdf_salt)?;
+        Ok(Vault { header, index })
     }
 
     /// Opens an existing vault from exported bytes.
@@ -157,8 +150,7 @@ impl Vault {
         // right away. Zeroizing wipes each buffer on every exit path,
         // including the early returns below.
         let master_key = Zeroizing::new(derive_master_key(password, &header)?);
-        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt)?;
         let enc_sub = Zeroizing::new(enc_sub);
         let hmac_sub = Zeroizing::new(hmac_sub);
         drop(master_key);
@@ -210,8 +202,7 @@ impl Vault {
             idx_data.nonce_counter,
             idx_data.data_nonce_counter,
             idx_data.files,
-        )
-        .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        )?;
 
         Ok(Vault { header, index })
     }
@@ -241,52 +232,45 @@ impl Vault {
     ///
     /// Name must be at most 255 bytes. Data must be at most 64 MiB.
     /// If a secret with the same name already exists, it is overwritten.
+    /// Returns [`VaultError::InvalidInput`] when a limit is exceeded, or when
+    /// the vault already holds `MAX_INDEX_ENTRIES` entries under other names.
     pub fn store(&mut self, name: &str, plaintext: &[u8]) -> Result<(), VaultError> {
         if name.len() > MAX_ENTRY_NAME_LEN {
-            return Err(VaultError::CryptoError(format!(
+            return Err(VaultError::InvalidInput(format!(
                 "Entry name too long: {} bytes (max {})",
                 name.len(),
                 MAX_ENTRY_NAME_LEN
             )));
         }
         if plaintext.len() > MAX_ENTRY_DATA_SIZE {
-            return Err(VaultError::CryptoError(format!(
+            return Err(VaultError::InvalidInput(format!(
                 "Entry data too large: {} bytes (max {})",
                 plaintext.len(),
                 MAX_ENTRY_DATA_SIZE
             )));
         }
 
-        let data_counter = self
-            .index
-            .next_data_nonce_counter()
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        // Computed once: it is both the map key and part of the entry AAD
+        // (which prevents entry-swap attacks).
+        let hmac_key = self.index.hmac_key_for_name(name)?;
+
+        let data_counter = self.index.next_data_nonce_counter()?;
 
         // Random nonces from the OS CSPRNG. They are stored as the prefix of
         // each ciphertext, so they never need to be re-derived; randomness
         // also rules out reuse when two vault instances are opened from the
         // same persisted state.
         let mut data_nonce = [0u8; XCHACHA20_NONCE_LEN];
-        secure_bytes_fill(&mut data_nonce).map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        secure_bytes_fill(&mut data_nonce)?;
         let mut name_nonce = [0u8; XCHACHA20_NONCE_LEN];
-        secure_bytes_fill(&mut name_nonce).map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        secure_bytes_fill(&mut name_nonce)?;
 
-        // Compute HMAC'd key for AAD binding (prevents entry-swap attacks)
-        let hmac_key = self
-            .index
-            .lookup_hmac_key_for_name(name)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
         let entry_aad = build_entry_aad(&hmac_key, data_counter);
+        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
-        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let enc_key_bytes = extract_enc_key(enc_secret)?;
-
-        let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
+        let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)?;
         let encrypted_name_ct =
-            seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)
-                .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+            seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)?;
         drop(enc_key_bytes);
 
         let mut encrypted = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
@@ -307,9 +291,8 @@ impl Vault {
             data_counter,
         );
 
-        self.index
-            .insert_file(name, metadata)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))
+        self.index.insert_by_key(hmac_key, metadata)?;
+        Ok(())
     }
 
     /// Decrypts a secret and exposes it to `f` for the duration of the call.
@@ -377,19 +360,9 @@ impl Vault {
     }
 
     fn decrypt_secret(&self, name: &str) -> Result<Option<Vec<u8>>, VaultError> {
-        let hmac_key = self
-            .index
-            .lookup_hmac_key_for_name(name)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
-        let meta = self
-            .index
-            .lookup_file(name)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
-        let meta = match meta {
-            Some(m) => m,
-            None => return Ok(None),
+        let hmac_key = self.index.hmac_key_for_name(name)?;
+        let Some(meta) = self.index.lookup_by_key(&hmac_key) else {
+            return Ok(None);
         };
 
         let encrypted = match &meta.encrypted_data {
@@ -403,16 +376,14 @@ impl Vault {
             ));
         }
 
-        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let enc_key_bytes = extract_enc_key(enc_secret)?;
+        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
         let nonce: [u8; XCHACHA20_NONCE_LEN] = encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
         let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
 
         let entry_aad = build_entry_aad(&hmac_key, meta.data_counter);
 
-        let plaintext = open_with_aad(&enc_key_bytes, &nonce, ciphertext, &entry_aad)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let plaintext = open_with_aad(&enc_key_bytes, &nonce, ciphertext, &entry_aad)?;
         Ok(Some(plaintext))
     }
 
@@ -420,11 +391,8 @@ impl Vault {
     ///
     /// The removed entry's ciphertexts are zeroized when it is dropped.
     pub fn remove(&mut self, name: &str) -> Result<bool, VaultError> {
-        let removed = self
-            .index
-            .remove_file(name)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-        Ok(removed.is_some())
+        let hmac_key = self.index.hmac_key_for_name(name)?;
+        Ok(self.index.remove_by_key(&hmac_key).is_some())
     }
 
     /// Serializes the vault to bytes for persistence.
@@ -440,9 +408,7 @@ impl Vault {
     /// total stored plaintext is about 70 MiB. The vault itself is left
     /// intact by this error; remove entries and export again.
     pub fn export(&mut self) -> Result<Vec<u8>, VaultError> {
-        self.index
-            .advance_nonce()
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        self.index.advance_nonce()?;
 
         // Wrap in Zeroizing so the serialized header and index buffers are
         // cleared on scope exit. header_json carries only public KDF params,
@@ -458,12 +424,10 @@ impl Vault {
                 .map_err(|e| VaultError::SerializationError(e.to_string()))?,
         );
 
-        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let enc_key_bytes = extract_enc_key(enc_secret)?;
+        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
         let aad = self.header.to_aad_bytes()?;
-        let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_json, &aad)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_json, &aad)?;
         drop(enc_key_bytes);
 
         let header_len = (header_json.len() as u32).to_le_bytes();
@@ -500,7 +464,7 @@ impl Vault {
         let dir = path.parent().unwrap_or(Path::new("."));
 
         let mut rand_suffix = [0u8; 8];
-        secure_bytes_fill(&mut rand_suffix).map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        secure_bytes_fill(&mut rand_suffix)?;
         let hex_suffix: String = rand_suffix.iter().map(|b| format!("{:02x}", b)).collect();
         let tmp_path = dir.join(format!(".memseal_tmp_{}", hex_suffix));
 
@@ -560,8 +524,7 @@ impl Vault {
         let new_header = VaultHeader::generate()?;
         let new_master_key = Zeroizing::new(derive_master_key(new_password, &new_header)?);
         let new_index =
-            VaultIndex::from_master_key(new_master_key.as_slice(), &new_header.kdf_salt)
-                .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+            VaultIndex::from_master_key(new_master_key.as_slice(), &new_header.kdf_salt)?;
         drop(new_master_key);
 
         let mut new_vault = Vault {
@@ -569,8 +532,7 @@ impl Vault {
             index: new_index,
         };
 
-        let old_enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let old_enc_key = extract_enc_key(old_enc_secret)?;
+        let old_enc_key = extract_enc_key(self.index.enc_key())?;
 
         // Re-encrypt entries one at a time into new_vault, reading the old
         // ciphertexts in place.
@@ -591,8 +553,7 @@ impl Vault {
                     let nonce: [u8; XCHACHA20_NONCE_LEN] =
                         enc_name[..XCHACHA20_NONCE_LEN].try_into().unwrap();
                     let ct = &enc_name[XCHACHA20_NONCE_LEN..];
-                    let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)
-                        .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+                    let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)?;
                     Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
                         let mut bytes = e.into_bytes();
                         bytes.zeroize();
@@ -618,10 +579,8 @@ impl Vault {
             let nonce: [u8; XCHACHA20_NONCE_LEN] =
                 encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
             let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
-            let plaintext = Zeroizing::new(
-                open_with_aad(&old_enc_key, &nonce, ciphertext, &old_aad)
-                    .map_err(|e| VaultError::CryptoError(e.to_string()))?,
-            );
+            let plaintext =
+                Zeroizing::new(open_with_aad(&old_enc_key, &nonce, ciphertext, &old_aad)?);
 
             new_vault.store(&plaintext_name, &plaintext)?;
         }
@@ -639,14 +598,13 @@ impl Vault {
     /// stored one.
     fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
         let master_key = Zeroizing::new(derive_master_key(password, &self.header)?);
-        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &self.header.kdf_salt)
-            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &self.header.kdf_salt)?;
         let enc_sub = Zeroizing::new(enc_sub);
         drop(Zeroizing::new(hmac_sub));
         drop(master_key);
 
-        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        enc_secret
+        self.index
+            .enc_key()
             .with_bytes(|stored| orion::util::secure_cmp(stored, enc_sub.as_slice()))
             .map_err(|_| VaultError::InvalidPassword)
     }
@@ -654,7 +612,7 @@ impl Vault {
 
 fn validate_password(password: &[u8]) -> Result<(), VaultError> {
     if password.len() < MIN_PASSWORD_LEN {
-        return Err(VaultError::CryptoError(format!(
+        return Err(VaultError::InvalidInput(format!(
             "Password must be at least {} bytes",
             MIN_PASSWORD_LEN
         )));
@@ -1032,7 +990,7 @@ mod tests {
         let mut vault = Vault::create(b"real-pwd!").unwrap();
         assert!(matches!(
             vault.change_password(b"real-pwd!", b"short"),
-            Err(VaultError::CryptoError(_))
+            Err(VaultError::InvalidInput(_))
         ));
         assert_eq!(vault.index.nonce_counter, 0);
     }
@@ -1113,14 +1071,36 @@ mod tests {
 
     #[test]
     fn short_password_rejected() {
-        assert!(Vault::create(b"short").is_err());
+        assert!(matches!(
+            Vault::create(b"short"),
+            Err(VaultError::InvalidInput(_))
+        ));
     }
 
     #[test]
     fn long_entry_name_rejected() {
         let mut vault = Vault::create(b"password").unwrap();
         let long_name = "x".repeat(MAX_ENTRY_NAME_LEN + 1);
-        assert!(vault.store(&long_name, b"data").is_err());
+        assert!(matches!(
+            vault.store(&long_name, b"data"),
+            Err(VaultError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn full_vault_rejects_new_name_as_invalid_input() {
+        let mut vault = Vault::create(b"password").unwrap();
+        let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
+        for i in 0..max {
+            vault.store(&format!("k{}", i), b"v").unwrap();
+        }
+        assert!(matches!(
+            vault.store("one-more", b"v"),
+            Err(VaultError::InvalidInput(_))
+        ));
+        // Overwriting an existing name is still allowed at the cap.
+        vault.store("k0", b"v2").unwrap();
+        assert_eq!(vault.retrieve("k0").unwrap(), Some(b"v2".to_vec()));
     }
 
     #[test]
