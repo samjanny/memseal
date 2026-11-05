@@ -20,8 +20,6 @@ pub mod xchacha20_poly1305 {
     pub const XCHACHA20_NONCE_LEN: usize = 24;
 }
 
-pub const SECURE_MEMORY_VAULT_CHUNK_SIZE: usize = 4 * 1024; // 4 KiB
-
 // Bounds enforced by `validate_header` on the KDF parameters read from an
 // untrusted vault header (DESIGN.md sections 3 and 10). The header is parsed
 // and its parameters are fed to Argon2i before the password can be checked,

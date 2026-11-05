@@ -30,7 +30,7 @@ use crate::constants::{
 };
 use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
 use crate::crypto::utils::secure_bytes_fill;
-use crate::mem::secure_memory_vault::{MemoryVaultError, SecureMemoryVault};
+use crate::mem::locked_secret::LockedSecret;
 use crate::vault::vault_error::VaultError;
 use crate::vault::vault_header::VaultHeader;
 use crate::vault::vault_index::{
@@ -278,44 +278,38 @@ impl Vault {
             .map_err(|e| VaultError::CryptoError(e.to_string()))?;
         let entry_aad = build_entry_aad(&hmac_key, data_counter);
 
-        let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
+        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let enc_key_bytes = extract_enc_key(enc_secret)?;
 
-        let result = (|| -> Result<(), VaultError> {
-            let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)
+        let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)
+            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+
+        let encrypted_name_ct =
+            seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)
                 .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        drop(enc_key_bytes);
 
-            let encrypted_name_ct =
-                seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)
-                    .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        let mut encrypted = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
+        encrypted.extend_from_slice(&data_nonce);
+        encrypted.extend_from_slice(&ciphertext);
 
-            let mut encrypted = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
-            encrypted.extend_from_slice(&data_nonce);
-            encrypted.extend_from_slice(&ciphertext);
+        let mut enc_name = Vec::with_capacity(XCHACHA20_NONCE_LEN + encrypted_name_ct.len());
+        enc_name.extend_from_slice(&name_nonce);
+        enc_name.extend_from_slice(&encrypted_name_ct);
 
-            let mut enc_name = Vec::with_capacity(XCHACHA20_NONCE_LEN + encrypted_name_ct.len());
-            enc_name.extend_from_slice(&name_nonce);
-            enc_name.extend_from_slice(&encrypted_name_ct);
+        let metadata = IndexMetaBlockMetadata::new(
+            IndexMetaBlockLocation::Inline,
+            0,
+            0,
+            false,
+            Some(encrypted),
+            Some(enc_name),
+            data_counter,
+        );
 
-            let metadata = IndexMetaBlockMetadata::new(
-                IndexMetaBlockLocation::Inline,
-                0,
-                0,
-                false,
-                Some(encrypted),
-                Some(enc_name),
-                data_counter,
-            );
-
-            self.index
-                .insert_file(name, metadata)
-                .map_err(|e| VaultError::CryptoError(e.to_string()))?;
-
-            Ok(())
-        })();
-
-        enc_key_bytes.zeroize();
-        result
+        self.index
+            .insert_file(name, metadata)
+            .map_err(|e| VaultError::CryptoError(e.to_string()))
     }
 
     /// Decrypts a secret and exposes it to `f` for the duration of the call.
@@ -409,9 +403,8 @@ impl Vault {
             ));
         }
 
-        let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-
-        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
+        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let enc_key_bytes = extract_enc_key(enc_secret)?;
 
         let nonce: [u8; XCHACHA20_NONCE_LEN] = encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
         let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
@@ -419,10 +412,8 @@ impl Vault {
         let entry_aad = build_entry_aad(&hmac_key, meta.data_counter);
 
         let plaintext = open_with_aad(&enc_key_bytes, &nonce, ciphertext, &entry_aad)
-            .map_err(|e| VaultError::CryptoError(e.to_string()));
-
-        enc_key_bytes.zeroize();
-        Ok(Some(plaintext?))
+            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        Ok(Some(plaintext))
     }
 
     /// Removes a secret by name. Returns `true` if it existed.
@@ -467,15 +458,13 @@ impl Vault {
                 .map_err(|e| VaultError::SerializationError(e.to_string()))?,
         );
 
-        let enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let mut enc_key_bytes = extract_enc_key(enc_vault)?;
+        let enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let enc_key_bytes = extract_enc_key(enc_secret)?;
 
         let aad = self.header.to_aad_bytes()?;
         let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_json, &aad)
-            .map_err(|e| VaultError::CryptoError(e.to_string()));
-
-        enc_key_bytes.zeroize();
-        let encrypted_index = encrypted_index?;
+            .map_err(|e| VaultError::CryptoError(e.to_string()))?;
+        drop(enc_key_bytes);
 
         let header_len = (header_json.len() as u32).to_le_bytes();
 
@@ -595,22 +584,17 @@ impl Vault {
             })
             .collect();
 
-        let old_enc_vault = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
-        let mut old_enc_key = extract_enc_key(old_enc_vault).inspect_err(|_| {
+        let old_enc_secret = self.index.enc_key().ok_or(VaultError::InvalidKey)?;
+        let old_enc_key = extract_enc_key(old_enc_secret).inspect_err(|_| {
             new_master_key.zeroize();
         })?;
 
-        // Build new vault - zeroize both keys on any failure
+        // Build the new index; the master key is wiped on every path and
+        // `old_enc_key` wipes itself on drop.
         let new_index_result = VaultIndex::from_master_key(&new_master_key, &new_header.kdf_salt)
             .map_err(|e| VaultError::CryptoError(e.to_string()));
         new_master_key.zeroize();
-        let new_index = match new_index_result {
-            Ok(idx) => idx,
-            Err(e) => {
-                old_enc_key.zeroize();
-                return Err(e);
-            }
-        };
+        let new_index = new_index_result?;
 
         let mut new_vault = Vault {
             header: new_header,
@@ -674,8 +658,7 @@ impl Vault {
             }
             Ok(())
         })();
-
-        old_enc_key.zeroize();
+        drop(old_enc_key);
 
         // Only swap on full success - on error, self retains old keys/data
         // (nonce counter may have advanced from the export() verification above)
@@ -772,37 +755,22 @@ fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
     aad
 }
 
-/// Copies the 32-byte encryption subkey out of the secure memory vault.
+/// Copies the 32-byte encryption subkey out of its locked container into a
+/// zeroize-on-drop buffer that lives only for the calling operation.
 ///
-/// The subkey is always exactly 32 bytes (HKDF-SHA256 output). A shorter
-/// chunk is treated as a hard error rather than being silently ignored, which
-/// would otherwise leave the key buffer all-zero and lead to encryption or
-/// decryption under a known zero key.
-fn extract_enc_key(enc_vault: &SecureMemoryVault) -> Result<[u8; 32], VaultError> {
-    let mut enc_key_bytes = [0u8; 32];
-    let mut copied = false;
-    enc_vault
-        .access(|chunk, _tag| {
-            if chunk.len() < 32 {
-                return Err(MemoryVaultError::GenericError(
-                    "encryption subkey shorter than 32 bytes".to_string(),
-                ));
-            }
-            enc_key_bytes.copy_from_slice(&chunk[..32]);
-            copied = true;
-            Ok(())
-        })
-        .map_err(|e| {
-            enc_key_bytes.zeroize();
-            VaultError::CryptoError(e.to_string())
+/// The subkey is always exactly 32 bytes (HKDF-SHA256 output). Any other
+/// length is a hard error rather than being silently padded, which would
+/// otherwise lead to encryption or decryption under a partly known key.
+fn extract_enc_key(enc_secret: &LockedSecret) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    enc_secret.with_bytes(|bytes| {
+        let key: &[u8; 32] = bytes.try_into().map_err(|_| {
+            VaultError::CryptoError(format!(
+                "encryption subkey is {} bytes, expected 32",
+                bytes.len()
+            ))
         })?;
-    if !copied {
-        enc_key_bytes.zeroize();
-        return Err(VaultError::CryptoError(
-            "encryption subkey unavailable".to_string(),
-        ));
-    }
-    Ok(enc_key_bytes)
+        Ok(Zeroizing::new(*key))
+    })
 }
 
 fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_LEN], VaultError> {
@@ -828,31 +796,23 @@ mod tests {
     #[test]
     fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
         let key = [7u8; 32];
-        let vault = SecureMemoryVault::new(&key).unwrap();
-        let extracted = extract_enc_key(&vault).unwrap();
-        assert_eq!(extracted, key);
+        let secret = LockedSecret::new(&key).unwrap();
+        let extracted = extract_enc_key(&secret).unwrap();
+        assert_eq!(*extracted, key);
     }
 
     #[test]
-    fn extract_enc_key_rejects_short_subkey() {
-        // A subkey shorter than 32 bytes must be a hard error rather than a
-        // silent fall-through that would leave the key buffer all-zero and
-        // lead to encryption under a known zero key.
-        let short = [1u8; 16];
-        let vault = SecureMemoryVault::new(&short).unwrap();
-        assert!(matches!(
-            extract_enc_key(&vault),
-            Err(VaultError::CryptoError(_))
-        ));
-    }
-
-    #[test]
-    fn extract_enc_key_rejects_empty_subkey() {
-        let vault = SecureMemoryVault::new(&[]).unwrap();
-        assert!(matches!(
-            extract_enc_key(&vault),
-            Err(VaultError::CryptoError(_))
-        ));
+    fn extract_enc_key_rejects_wrong_length_subkey() {
+        // A subkey that is not exactly 32 bytes must be a hard error rather
+        // than a silent fall-through that would leave part of the key buffer
+        // all-zero and lead to encryption under a partly known key.
+        for len in [16usize, 31, 33, 64] {
+            let secret = LockedSecret::new(&vec![1u8; len]).unwrap();
+            assert!(matches!(
+                extract_enc_key(&secret),
+                Err(VaultError::CryptoError(_))
+            ));
+        }
     }
 
     #[test]

@@ -276,7 +276,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
 | **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap or whose entries are larger than `store()` can produce. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
-| **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `SecureMemoryVault`: it is encrypted under a fresh stream key, and the key, its nonce, and the ciphertext share one `memsec` allocation that occupies pages of its own, sits between guard pages, is locked with `mlock` where supported (on Linux also excluded from core dumps), and is zeroized on drop. |
+| **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `LockedSecret`: a `memsec` allocation that occupies pages of its own, sits between guard pages, is locked with `mlock` where supported (on Linux also excluded from core dumps), and is zeroized on drop. |
 
 ### Out of scope / limitations
 
@@ -288,7 +288,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. This includes the timing difference between a hit and a miss in `retrieve()`/`with_secret()`, which reveals whether a name exists to anyone who can time calls. |
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
 | **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |
-| **Full swap protection** | Only the two `SecureMemoryVault` allocations that hold the subkeys are locked. Transient copies made during each operation, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
+| **Full swap protection** | Only the two `LockedSecret` allocations that hold the subkeys are locked. Transient copies made during each operation, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
 | **Rollback protection** | memseal does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless the application stores freshness/version information externally. |
 | **File permissions on Windows** | `save()` creates the file with mode `0600` on Unix only. On Windows the file inherits the DACL of its directory; restricting it is the caller's job. |
 | **Untrusted paths** | `load()` and `save()` follow symbolic links like any `std::fs` call and do not validate the path. Callers that accept paths from untrusted sources must validate them first; `open()`/`load()` bound the work a hostile file can cause but do not make it free. |
@@ -325,7 +325,7 @@ Index encryption:
   vault header is authenticated as AAD
 ```
 
-Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold the two subkeys (each one stream key, nonce, and ciphertext). It does not lock every secret-related allocation. Each container occupies at least one page of its own, so every open `Vault` holds two locked pages (8 KiB with 4 KiB pages) against `RLIMIT_MEMLOCK`; `Vault::create`, `open`, and `load` fail with `CryptoError` when the limit is exhausted rather than fall back to unlocked memory.
+Note: `mlock` is applied only to the two `LockedSecret` allocations that hold the subkeys. The subkeys are stored in the clear inside those locked pages: encrypting them in memory would need a key with the same protection, so it would add nothing an attacker who can read the pages does not already get. The lock does not cover every secret-related allocation. Each container occupies at least one page of its own, so every open `Vault` holds two locked pages (8 KiB with 4 KiB pages) against `RLIMIT_MEMLOCK`; `Vault::create`, `open`, and `load` fail with `CryptoError` when the limit is exhausted rather than fall back to unlocked memory.
 
 ## Cryptographic Primitives
 
@@ -336,7 +336,7 @@ Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold t
 | XChaCha20-Poly1305 | `orion` | Authenticated encryption |
 | HMAC-SHA256 | `orion` | Entry-name hashing |
 | OsRng | `rand_core` | Random salt and nonce generation |
-| `mlock` / `munlock` | `memsec` | Best-effort locking of the in-memory subkey containers |
+| `mlock` / `munlock` | `memsec` | Page-exclusive locked allocations for the two subkeys |
 | Zeroization | `zeroize` | Clearing internal temporary secrets where possible |
 
 ## Security Properties
@@ -348,7 +348,7 @@ Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold t
 - **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing; a hostile file can cost at most one bounded Argon2i derivation (256 MiB, 10 passes) before it is rejected.
 - **Atomic file writes.** `save()` writes to a temporary file, fsyncs it, renames it, and uses `0600` permissions on Unix (Windows inherits the directory ACL).
 - **Best-effort memory hygiene.** Internal temporary key material and plaintext are zeroized where possible.
-- **Partial swap protection.** The in-memory subkey containers (stream key, nonce, and ciphertext together) are locked with `mlock` where supported, but this does not cover every allocation.
+- **Partial swap protection.** The two subkey containers are locked with `mlock` where supported, but this does not cover every allocation.
 
 ## Comparison
 

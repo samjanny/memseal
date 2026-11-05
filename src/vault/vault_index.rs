@@ -4,7 +4,7 @@ use crate::constants::vault_index_constants::{
 };
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::crypto::utils::secure_bytes_fill;
-use crate::mem::secure_memory_vault::{MemoryVaultError, SecureMemoryVault};
+use crate::mem::locked_secret::LockedSecret;
 use orion::hazardous::kdf::hkdf;
 use orion::hazardous::mac::hmac::sha256::{HmacSha256, SecretKey as HmacSecretKey};
 use serde::{Deserialize, Serialize};
@@ -67,9 +67,9 @@ pub struct VaultIndex {
     pub data_nonce_counter: u64,
     pub files: HashMap<String, IndexMetaBlockMetadata>,
     #[serde(skip)]
-    enc_key: Option<SecureMemoryVault>,
+    enc_key: Option<LockedSecret>,
     #[serde(skip)]
-    hmac_key: Option<SecureMemoryVault>,
+    hmac_key: Option<LockedSecret>,
 }
 
 /// Derives separate encryption and HMAC subkeys from a master key via HKDF-SHA256.
@@ -89,8 +89,8 @@ pub fn derive_subkeys(
 }
 
 impl VaultIndex {
-    /// Returns a reference to the encryption subkey vault, if present.
-    pub fn enc_key(&self) -> Option<&SecureMemoryVault> {
+    /// Returns a reference to the encryption subkey container, if present.
+    pub fn enc_key(&self) -> Option<&LockedSecret> {
         self.enc_key.as_ref()
     }
 
@@ -129,30 +129,23 @@ impl VaultIndex {
     }
 
     fn hmac_filename(&self, plaintext_name: &str) -> Result<String, IndexError> {
-        let hmac_vault = self.hmac_key.as_ref().ok_or(IndexError::GenericError(
+        let hmac_secret = self.hmac_key.as_ref().ok_or(IndexError::GenericError(
             "HMAC key not available".to_string(),
         ))?;
 
-        let mut hex_result: Result<String, IndexError> =
-            Err(IndexError::GenericError("HMAC not computed".to_string()));
-        hmac_vault
-            .access(|key_chunk, _tag| {
-                let hmac_key =
-                    HmacSecretKey::from_slice(key_chunk).map_err(|_| MemoryVaultError::Crypto)?;
-                let tag = HmacSha256::hmac(&hmac_key, plaintext_name.as_bytes())
-                    .map_err(|_| MemoryVaultError::Crypto)?;
+        let tag = hmac_secret.with_bytes(|key_bytes| {
+            let hmac_key = HmacSecretKey::from_slice(key_bytes)
+                .map_err(|_| IndexError::GenericError("HMAC key invalid".to_string()))?;
+            HmacSha256::hmac(&hmac_key, plaintext_name.as_bytes())
+                .map_err(|_| IndexError::GenericError("HMAC failed".to_string()))
+        })?;
 
-                let tag_bytes = tag.unprotected_as_bytes();
-                let mut hex = String::with_capacity(tag_bytes.len() * 2);
-                for b in tag_bytes {
-                    write!(hex, "{:02x}", b).unwrap();
-                }
-                hex_result = Ok(hex);
-                Ok(())
-            })
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
-
-        hex_result
+        let tag_bytes = tag.unprotected_as_bytes();
+        let mut hex = String::with_capacity(tag_bytes.len() * 2);
+        for b in tag_bytes {
+            write!(hex, "{:02x}", b).unwrap();
+        }
+        Ok(hex)
     }
 
     /// Returns the HMAC'd key for a given plaintext name (for use as AAD).
@@ -205,8 +198,8 @@ impl VaultIndex {
         nonce: [u8; XCHACHA20_NONCE_LEN],
         nonce_counter: u64,
         data_nonce_counter: u64,
-        enc_key: Option<SecureMemoryVault>,
-        hmac_key: Option<SecureMemoryVault>,
+        enc_key: Option<LockedSecret>,
+        hmac_key: Option<LockedSecret>,
         files: HashMap<String, IndexMetaBlockMetadata>,
     ) -> Result<Self, IndexError> {
         if !SUPPORTED_VAULT_INDEX_VERSIONS.contains(&version) {
@@ -231,10 +224,10 @@ impl VaultIndex {
         let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
         secure_bytes_fill(&mut nonce).map_err(|e| IndexError::NonceError(e.to_string()))?;
 
-        let enc_vault = SecureMemoryVault::new(&enc_sub)
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
-        let hmac_vault = SecureMemoryVault::new(&hmac_sub)
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
+        let enc_vault =
+            LockedSecret::new(&enc_sub).map_err(|e| IndexError::GenericError(e.to_string()));
+        let hmac_vault =
+            LockedSecret::new(&hmac_sub).map_err(|e| IndexError::GenericError(e.to_string()));
 
         enc_sub.zeroize();
         hmac_sub.zeroize();
@@ -244,8 +237,8 @@ impl VaultIndex {
             nonce,
             initial_counter,
             0,
-            Some(enc_vault),
-            Some(hmac_vault),
+            Some(enc_vault?),
+            Some(hmac_vault?),
             HashMap::new(),
         )
     }
@@ -280,9 +273,9 @@ impl VaultIndex {
         }
 
         let enc_vault =
-            SecureMemoryVault::new(enc_sub).map_err(|e| IndexError::GenericError(e.to_string()))?;
-        let hmac_vault = SecureMemoryVault::new(hmac_sub)
-            .map_err(|e| IndexError::GenericError(e.to_string()))?;
+            LockedSecret::new(enc_sub).map_err(|e| IndexError::GenericError(e.to_string()))?;
+        let hmac_vault =
+            LockedSecret::new(hmac_sub).map_err(|e| IndexError::GenericError(e.to_string()))?;
 
         VaultIndex::from_data(
             VAULT_INDEX_VERSION,
@@ -388,24 +381,8 @@ mod tests {
     #[test]
     fn enc_and_hmac_keys_are_different() {
         let idx = VaultIndex::generate().unwrap();
-        let mut enc_bytes = Vec::new();
-        idx.enc_key
-            .as_ref()
-            .unwrap()
-            .access(|chunk, _| {
-                enc_bytes.extend_from_slice(chunk);
-                Ok(())
-            })
-            .unwrap();
-        let mut hmac_bytes = Vec::new();
-        idx.hmac_key
-            .as_ref()
-            .unwrap()
-            .access(|chunk, _| {
-                hmac_bytes.extend_from_slice(chunk);
-                Ok(())
-            })
-            .unwrap();
+        let enc_bytes = idx.enc_key.as_ref().unwrap().with_bytes(|b| b.to_vec());
+        let hmac_bytes = idx.hmac_key.as_ref().unwrap().with_bytes(|b| b.to_vec());
         assert_ne!(enc_bytes, hmac_bytes);
         assert_eq!(enc_bytes.len(), SUBKEY_LEN);
         assert_eq!(hmac_bytes.len(), SUBKEY_LEN);

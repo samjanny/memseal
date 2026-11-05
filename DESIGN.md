@@ -143,19 +143,23 @@ The `enc_key` is used for all XChaCha20-Poly1305 operations on the index
 and on per-entry payloads. The `hmac_key` is used exclusively for
 HMAC-SHA256 of entry names (see section 7).
 
-Both subkeys are stored in `SecureMemoryVault` for the lifetime of the
-`Vault`. Each container encrypts its subkey under a fresh in-memory
-XChaCha20-Poly1305 stream key and keeps that key, its nonce, and the
-ciphertext in a single `mlock`'d allocation (on Linux also marked
-`MADV_DONTDUMP` by `memsec`), which is zeroized on drop. The allocation
+Both subkeys are stored in a `LockedSecret` each for the lifetime of the
+`Vault`: a single `mlock`'d allocation (on Linux also marked
+`MADV_DONTDUMP` by `memsec`) that is zeroized on drop. The allocation
 comes from `memsec::malloc_sized`, so it occupies pages no other
 allocation shares and sits between two guard pages. Page exclusivity is
 required for the lock to mean anything: `munlock` is not reference
 counted, so two containers in one page would unlock each other on drop.
 The cost is one page of `RLIMIT_MEMLOCK` per container, two per open
 `Vault`; a failed `mlock` is reported as an error rather than degraded to
-unlocked memory. The raw master key is zeroized as soon as the subkeys
-are derived; `open()` derives them exactly once.
+unlocked memory.
+
+The subkeys are kept in the clear inside the locked pages. Releases up to
+0.2.1 encrypted them in memory under a per-container stream key, but that
+key had to live in memory with the same protection as the ciphertext, so
+the layer protected nothing against a reader of the pages and cost an
+AEAD operation on every key use. The raw master key is zeroized as soon
+as the subkeys are derived; `open()` derives them exactly once.
 
 
 ## 5. Nonce generation

@@ -9,10 +9,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
-* `SecureMemoryVault` now allocates its locked region with `memsec::malloc_sized`, which places the bytes in pages no other allocation shares, between two guard pages. Previously the region was an ordinary `Vec` of about 100 bytes, so two containers (for example the subkeys of two open vaults) routinely landed in the same page; since `munlock` is not reference counted, dropping one vault silently unlocked the subkeys of the other while `is_locked()` still reported `true`. Each container now costs one page of `RLIMIT_MEMLOCK` (two per open `Vault`), and a failed `mlock` is still reported as an error.
+* The subkey containers now allocate their locked region with `memsec::malloc_sized`, which places the bytes in pages no other allocation shares, between two guard pages. Previously the region was an ordinary `Vec` of about 100 bytes, so two containers (for example the subkeys of two open vaults) routinely landed in the same page; since `munlock` is not reference counted, dropping one vault silently unlocked the subkeys of the other while `is_locked()` still reported `true`. Each container now costs one page of `RLIMIT_MEMLOCK` (two per open `Vault`), and a failed `mlock` is still reported as an error.
 
 ### Changed
 
+* `SecureMemoryVault` is replaced by `LockedSecret`, which keeps each subkey in the clear inside its page-exclusive locked allocation. The in-memory streaming XChaCha20-Poly1305 layer is gone: its stream key had to live in the same locked region as the ciphertext it protected, so it added nothing against a reader of that region while costing an AEAD operation on every `store`, `retrieve`, `export`, and entry-name HMAC. The subkey is now lent to each operation as a zeroize-on-drop copy that lives only for that call.
 * Removed internal code that no `Vault` operation used: the bounded random integer helpers, the `SecureConstructor`/`SecureAccess` traits with their `EncryptionError`, the `NonceRotation` type-state on `VaultIndex`, `VaultIndex::generate`, `from_master_key_and_data`, `generate_dummy`, the unused `kdf_salt` copy held by the index, and `SecureMemoryVault::{safe_new, len, is_empty}`. The `secrecy` dependency went with the traits. The crate-level `#![allow(dead_code)]` is gone, so unused items now fail the clippy job in CI. The public API is unchanged.
 
 ### Fixed

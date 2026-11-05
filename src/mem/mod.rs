@@ -1,1 +1,1 @@
-pub mod secure_memory_vault;
+pub mod locked_secret;
