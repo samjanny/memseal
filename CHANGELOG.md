@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
 ### Security
 
 * The Argon2id memory matrix is allocated by `derive_master_key` in a zeroize-on-drop buffer and handed to `argon2::Argon2::hash_password_into_with_memory`. The crate's allocating entry point frees the matrix without clearing it, and its last block is one hash away from the master key, so with an allocator that keeps large freed blocks mapped a core dump or memory disclosure taken after `open` or `create` could have contained master-key-equivalent data. (The Argon2i path through `orion`, still used to open version 1 files, wipes its own blocks.)
@@ -203,7 +205,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/samjanny/memseal/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/samjanny/memseal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/samjanny/memseal/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/samjanny/memseal/compare/v0.1.5...v0.1.6
