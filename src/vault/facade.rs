@@ -22,6 +22,7 @@
 //! ```
 
 use crate::constants::argon2::KEY_LEN;
+use crate::constants::subkeys::SUBKEY_LEN;
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::constants::{
     LEGACY_VAULT_VERSION_1, MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MAX_HEADER_JSON_LEN,
@@ -110,13 +111,20 @@ impl Vault {
         let header = envelope.header;
 
         // Argon2 is the expensive step; everything above is cheap. The two
-        // subkeys are derived exactly once and the master key is dropped
-        // right away. Zeroizing wipes each buffer on every exit path,
-        // including the early returns below.
+        // subkeys are derived once for this header and the master key is
+        // dropped right away. Zeroizing wipes each buffer on every exit
+        // path, including the early returns below. (A version 1 file goes
+        // through a second derivation in `rekey` below, after it has
+        // authenticated.)
         let master_key = derive_master_key(password, &header)?;
-        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt)?;
-        let enc_sub = Zeroizing::new(enc_sub);
-        let hmac_sub = Zeroizing::new(hmac_sub);
+        let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        derive_subkeys(
+            master_key.as_slice(),
+            &header.kdf_salt,
+            &mut enc_sub,
+            &mut hmac_sub,
+        )?;
         drop(master_key);
 
         let aad = header.to_aad_bytes()?;
@@ -179,7 +187,8 @@ impl Vault {
     /// Name must be at most 255 bytes. Data must be at most 64 MiB.
     /// If a secret with the same name already exists, it is overwritten.
     /// Returns [`VaultError::InvalidInput`] when a limit is exceeded, or when
-    /// the vault already holds `MAX_INDEX_ENTRIES` entries under other names.
+    /// the vault already holds 1024 entries under other names (overwriting
+    /// an existing name is still allowed at the cap).
     pub fn store(&mut self, name: &str, plaintext: &[u8]) -> Result<(), VaultError> {
         if name.len() > MAX_ENTRY_NAME_LEN {
             return Err(VaultError::InvalidInput(format!(
@@ -333,9 +342,10 @@ impl Vault {
     /// exceeds the 256 MiB file-size bound enforced by [`Vault::load`]; this
     /// guarantees that anything `export()` produces can be loaded back. The
     /// index is a compact binary encoding, so the bound on total stored
-    /// ciphertext is close to the file bound itself (about 56 bytes of
-    /// overhead per entry plus the header). The vault itself is left intact
-    /// by this error; remove entries and export again.
+    /// secrets is close to the file bound itself: each entry costs its
+    /// plaintext size plus 128 bytes plus the name length, on top of a
+    /// header of a few hundred bytes. The vault itself is left intact by
+    /// this error; remove entries and export again.
     pub fn export(&mut self) -> Result<Vec<u8>, VaultError> {
         self.index.advance_nonce()?;
 
@@ -383,7 +393,13 @@ impl Vault {
         use std::io::Write;
 
         let data = self.export()?;
-        let dir = path.parent().unwrap_or(Path::new("."));
+        // `Path::parent` of a bare file name is `Some("")`, not `None`; both
+        // mean the current directory, and `""` cannot be opened for the
+        // directory fsync below.
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
 
         let mut rand_suffix = [0u8; 8];
         secure_bytes_fill(&mut rand_suffix)?;
@@ -496,9 +512,15 @@ impl Vault {
     /// stored one.
     fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
         let master_key = derive_master_key(password, &self.header)?;
-        let (enc_sub, hmac_sub) = derive_subkeys(master_key.as_slice(), &self.header.kdf_salt)?;
-        let enc_sub = Zeroizing::new(enc_sub);
-        drop(Zeroizing::new(hmac_sub));
+        let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        derive_subkeys(
+            master_key.as_slice(),
+            &self.header.kdf_salt,
+            &mut enc_sub,
+            &mut hmac_sub,
+        )?;
+        drop(hmac_sub);
         drop(master_key);
 
         self.index
@@ -523,6 +545,16 @@ pub(crate) struct Envelope<'a> {
 /// right target for fuzzing the untrusted-input parser without paying for
 /// Argon2 on every input.
 pub(crate) fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
+    // `load` already enforces this on the file; `open` takes bytes from
+    // anywhere, so the same cap applies here. It bounds the AEAD pass and
+    // the index allocation at 256 MiB, as DESIGN.md section 10.1 promises.
+    if data.len() as u64 > MAX_VAULT_FILE_SIZE {
+        return Err(VaultError::CorruptedData(format!(
+            "Vault data of {} bytes exceeds maximum {}",
+            data.len(),
+            MAX_VAULT_FILE_SIZE
+        )));
+    }
     if data.len() < 4 {
         return Err(VaultError::CorruptedData("Data too short".to_string()));
     }
@@ -546,10 +578,22 @@ pub(crate) fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
         ));
     }
 
-    let header: VaultHeader = serde_json::from_slice(&data[4..after_header])
+    let header_bytes = &data[4..after_header];
+    let header: VaultHeader = serde_json::from_slice(header_bytes)
         .map_err(|e| VaultError::CorruptedData(format!("Invalid header JSON: {}", e)))?;
 
     validate_header(&header)?;
+
+    // The AAD is the canonical serialization of the parsed header, so the
+    // bytes in the file are only authenticated if they are that
+    // serialization. Require it: every file this library has written is in
+    // canonical form, and anything else (reordered or padded JSON) would be
+    // an unauthenticated edit (DESIGN.md section 3).
+    if header_bytes != header.to_aad_bytes()?.as_slice() {
+        return Err(VaultError::CorruptedData(
+            "Header JSON is not in canonical form".to_string(),
+        ));
+    }
 
     let nonce: [u8; XCHACHA20_NONCE_LEN] = data[after_header..after_header + XCHACHA20_NONCE_LEN]
         .try_into()
@@ -638,10 +682,10 @@ fn split_nonce(blob: &[u8]) -> Result<([u8; XCHACHA20_NONCE_LEN], &[u8]), VaultE
     Ok((nonce, &blob[XCHACHA20_NONCE_LEN..]))
 }
 
-fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
+fn build_entry_aad(hmac_key: &str, counter: u64) -> Zeroizing<Vec<u8>> {
     let key_bytes = hmac_key.as_bytes();
     let counter_bytes = counter.to_le_bytes();
-    let mut aad = Vec::with_capacity(key_bytes.len() + 8);
+    let mut aad = Zeroizing::new(Vec::with_capacity(key_bytes.len() + 8));
     aad.extend_from_slice(key_bytes);
     aad.extend_from_slice(&counter_bytes);
     aad
@@ -654,15 +698,20 @@ fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
 /// length is a hard error rather than being silently padded, which would
 /// otherwise lead to encryption or decryption under a partly known key.
 fn extract_enc_key(enc_secret: &LockedSecret) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    // Copy straight into the zeroizing buffer rather than through a bare
+    // array, so no unwiped copy is left on the stack.
+    let mut key = Zeroizing::new([0u8; 32]);
     enc_secret.with_bytes(|bytes| {
-        let key: &[u8; 32] = bytes.try_into().map_err(|_| {
-            VaultError::CryptoError(format!(
+        if bytes.len() != key.len() {
+            return Err(VaultError::CryptoError(format!(
                 "encryption subkey is {} bytes, expected 32",
                 bytes.len()
-            ))
-        })?;
-        Ok(Zeroizing::new(*key))
-    })
+            )));
+        }
+        key.copy_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok(key)
 }
 
 /// Derives the master key from the password with the KDF of the header's
@@ -693,8 +742,18 @@ fn derive_master_key(
             Some(KEY_LEN),
         )
         .map_err(|e| VaultError::CryptoError(format!("Argon2id parameters: {}", e)))?;
+        // `hash_password_into` would allocate the memory matrix itself and
+        // free it without wiping; the last block of the lane is one hash away
+        // from the master key, so the matrix is owned here and zeroized on
+        // drop (the Argon2i path through `orion` wipes its own blocks).
+        let mut blocks = Zeroizing::new(vec![argon2::Block::default(); params.block_count()]);
         argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(password, &header.kdf_salt, master_key.as_mut_slice())
+            .hash_password_into_with_memory(
+                password,
+                &header.kdf_salt,
+                master_key.as_mut_slice(),
+                blocks.as_mut_slice(),
+            )
             .map_err(|e| VaultError::CryptoError(format!("Argon2id derivation failed: {}", e)))?;
     }
     Ok(master_key)
@@ -1364,6 +1423,15 @@ mod tests {
         serde_json::from_slice(&export[4..4 + header_len]).unwrap()
     }
 
+    /// Re-encodes an edited header value in canonical form (struct field
+    /// order), so the edit reaches the AEAD instead of being rejected by
+    /// the canonical-form check. `serde_json::Value` alone would emit the
+    /// fields in alphabetical order.
+    fn canonical_header_json(value: &serde_json::Value) -> Vec<u8> {
+        let header: VaultHeader = serde_json::from_value(value.clone()).unwrap();
+        header.to_aad_bytes().unwrap()
+    }
+
     #[test]
     fn open_rejects_malformed_header_json() {
         let valid = make_valid_export(b"password-dddd");
@@ -1410,7 +1478,7 @@ mod tests {
             "version".to_string(),
             serde_json::Value::Number(LEGACY_VAULT_VERSION_1.into()),
         );
-        let new_json = serde_json::to_vec(&value).unwrap();
+        let new_json = canonical_header_json(&value);
         let tampered = replace_header_json(&valid, &new_json);
         assert!(matches!(
             Vault::open(b"password-downgrade", &tampered),
@@ -1465,10 +1533,55 @@ mod tests {
         // Flip a byte in the salt.
         let first = salt[0].as_u64().unwrap();
         salt[0] = serde_json::Value::Number((first ^ 0xFF & 0xFF).into());
-        let new_json = serde_json::to_vec(&value).unwrap();
+        let new_json = canonical_header_json(&value);
         let tampered = replace_header_json(&valid, &new_json);
         let result = Vault::open(b"password-hhhh", &tampered);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
+    }
+
+    #[test]
+    fn open_rejects_header_with_unknown_field() {
+        // The AAD is the canonical serialization of the parsed header, so an
+        // unknown field would be ignored by the parser and never
+        // authenticated. It must be rejected before Argon2 runs.
+        let valid = make_valid_export(b"password-ffff");
+        let mut value = extract_header_value(&valid);
+        value.as_object_mut().unwrap().insert(
+            "injected".to_string(),
+            serde_json::Value::String("unauthenticated".to_string()),
+        );
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        let result = Vault::open(b"password-ffff", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_non_canonical_header_json() {
+        // Same fields and values, different bytes (pretty-printed with the
+        // same field order): the parsed header would reproduce the original
+        // AAD, so the edit would otherwise go unnoticed.
+        let valid = make_valid_export(b"password-gggg");
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let value = extract_header_value(&valid);
+        let pretty = serde_json::to_vec_pretty(&value).unwrap();
+        assert_ne!(pretty.as_slice(), &valid[4..4 + header_len]);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&pretty).unwrap(),
+            value
+        );
+        let tampered = replace_header_json(&valid, &pretty);
+        let result = Vault::open(b"password-gggg", &tampered);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_data_above_file_size_cap() {
+        // `open` takes bytes from anywhere, so it enforces the same 256 MiB
+        // cap as `load`, before parsing anything.
+        let data = vec![0u8; MAX_VAULT_FILE_SIZE as usize + 1];
+        let result = Vault::open(b"password-hhhh", &data);
+        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
     }
 
     #[test]
@@ -1633,8 +1746,15 @@ mod tests {
 
         let header = VaultHeader::generate().unwrap();
         let master_key = derive_master_key(password, &header).unwrap();
-        let (enc_sub, _hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt).unwrap();
-        let enc_sub = Zeroizing::new(enc_sub);
+        let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        derive_subkeys(
+            master_key.as_slice(),
+            &header.kdf_salt,
+            &mut enc_sub,
+            &mut hmac_sub,
+        )
+        .unwrap();
 
         // Any unique nonce works: open() reads the nonce from the file and
         // never re-derives it.

@@ -5,10 +5,14 @@ use crate::vault::vault_error::VaultError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Vault header containing KDF parameters and format version.
 ///
-/// Serialized to JSON and used as AAD during index encryption,
-/// so any tampering causes authenticated decryption failure.
+/// Serialized to JSON and used as AAD during index encryption, so any
+/// tampering causes authenticated decryption failure. `parse_envelope`
+/// additionally requires the stored bytes to be exactly this canonical
+/// serialization, so there is no room for unauthenticated bytes (such as
+/// unknown fields or whitespace) inside the header.
 pub struct VaultHeader {
     pub version: u16,
     pub kdf_salt: [u8; SALT_LEN],

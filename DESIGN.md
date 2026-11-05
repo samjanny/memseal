@@ -62,32 +62,39 @@ about 150 bytes. Larger values are rejected before the JSON is touched.
 
 In order, `Vault::open(password, data)` enforces:
 
-1. `data.len() >= 4` (room for `header_len`).
-2. `header_len <= MAX_HEADER_JSON_LEN` (4 KiB). This also rules out any
+1. `data.len() <= MAX_VAULT_FILE_SIZE` (256 MiB), the same cap `load`
+   applies to the file, so the AEAD pass and the index allocation below
+   are bounded whatever the source of the bytes.
+2. `data.len() >= 4` (room for `header_len`).
+3. `header_len <= MAX_HEADER_JSON_LEN` (4 KiB). This also rules out any
    offset overflow in the steps below.
-3. `data.len() >= 4 + header_len + 24` (room for header and nonce).
-4. `header_json` parses as valid `VaultHeader` JSON.
-5. `validate_header(&header)` succeeds (see section 3). This is the last
-   check before Argon2 runs with the parameters taken from the header.
-   If `header.version` is 1, the 8 legacy counter bytes that follow the
-   nonce must also be present and are skipped (section 12).
-6. Argon2id (Argon2i under a version 1 header) and HKDF derive the
+4. `data.len() >= 4 + header_len + 24` (room for header and nonce).
+5. `header_json` parses as valid `VaultHeader` JSON with no unknown
+   fields.
+6. `validate_header(&header)` succeeds (see section 3).
+7. `header_json` is byte-for-byte the canonical serialization of the
+   parsed header (`serde_json::to_vec`), which is also the AAD of step 8.
+   This is the last check before Argon2 runs with the parameters taken
+   from the header. If `header.version` is 1, the 8 legacy counter bytes
+   that follow the nonce must also be present and are skipped (section
+   12).
+8. Argon2id (Argon2i under a version 1 header) and HKDF derive the
    subkeys, then XChaCha20-Poly1305 verification of `encrypted_index`
    succeeds with the serialized header JSON as AAD.
-7. The decrypted index decodes under the rules of section 7 (version tag,
+9. The decrypted index decodes under the rules of section 7 (version tag,
    entry count, every length against the remaining bytes and the
    documented bounds, no duplicate keys, no trailing bytes). A version 1
    header selects the legacy JSON decoder of section 12 instead.
-8. `data_nonce_counter` is strictly greater than every stored
-   `data_counter` (section 7).
+10. `data_nonce_counter` is strictly greater than every stored
+    `data_counter` (section 7).
 
-Steps 1-5 are implemented by `parse_envelope`, a pure function with no
-key derivation, and step 7 by `decode_index`; both are the intended fuzz
-targets. Failures at steps 1-5 return `VaultError::CorruptedData(...)`.
-Failure at step 6 returns `VaultError::InvalidPassword`: the AEAD does not
+Steps 1-7 are implemented by `parse_envelope`, a pure function with no
+key derivation, and step 9 by `decode_index`; both are the intended fuzz
+targets. Failures at steps 1-7 return `VaultError::CorruptedData(...)`.
+Failure at step 8 returns `VaultError::InvalidPassword`: the AEAD does not
 distinguish "wrong key" from "tampered ciphertext or AAD" by design, so
 the variant means "authentication failed", not "the password was
-mistyped". Failures at steps 7 and 8 return
+mistyped". Failures at steps 9 and 10 return
 `VaultError::CorruptedData(...)`.
 
 
@@ -97,16 +104,16 @@ Serialized as JSON. Fields (all required, no serde defaults):
 
 | field             | type     | meaning                                         |
 | ----------------- | -------- | ----------------------------------------------- |
-| `version`         | u16      | must equal `VAULT_VERSION` (currently `1`)      |
+| `version`         | u16      | one of `SUPPORTED_VAULT_VERSIONS` (`1` or `2`); `export` always writes `VAULT_VERSION` (`2`) |
 | `kdf_salt`        | [u8; 16] | random salt for Argon2                          |
 | `kdf_iterations`  | u32      | Argon2 `t`, in `[3, 10]`                        |
 | `kdf_memory_cost` | u32      | Argon2 `m` in KiB, in `[32 MiB, 256 MiB]`       |
+| `key_length`      | usize    | must equal `KEY_LEN` (currently `32`)           |
 
 The KDF variant is implied by `version`: Argon2id for version 2, Argon2i
 for version 1 (section 12). It is not a separate header field because a
 different variant is by definition a different format version (section
 11).
-| `key_length`      | usize    | must equal `KEY_LEN` (currently `32`)           |
 
 The KDF bounds are deliberately narrow; section 10.1 explains the policy.
 Every vault written by this library uses the defaults (128 MiB, 4
@@ -117,15 +124,18 @@ The header has two responsibilities:
 * Carry the parameters needed to re-derive the master key from a password
   on `open()`.
 * Authenticate itself as AAD against the encrypted index. Any byte
-  modification to the serialized JSON causes index decryption to fail.
+  modification to the serialized JSON causes `open` to fail.
 
-The exact bytes used as AAD are produced by `serde_json::to_vec(&header)`,
-not the bytes read from the file. This means semantically-equal JSON
-encodings that differ in formatting (whitespace, field order) would
-diverge from the canonical AAD. The reference implementation always
-produces the same canonical encoding via `serde_json::to_vec`, so this is
-not a problem in practice for files produced by memseal; it is a property
-to be aware of if a third party ever re-encodes the header.
+The exact bytes used as AAD are produced by `serde_json::to_vec(&header)`
+from the parsed header, not the bytes read from the file. On its own that
+would leave room for unauthenticated bytes: a re-encoded header with
+different whitespace, field order, or extra fields parses to the same
+struct and therefore the same AAD. `parse_envelope` closes that gap by
+requiring the stored header bytes to equal the canonical serialization of
+the parsed header (step 7 of section 2.1) and by rejecting unknown fields
+at parse time. Every file memseal has written is in canonical form, so the
+check costs nothing for genuine files, and any other encoding is reported
+as `CorruptedData` before Argon2 runs.
 
 
 ## 4. Key derivation chain
@@ -163,15 +173,23 @@ allocation shares and sits between two guard pages. Page exclusivity is
 required for the lock to mean anything: `munlock` is not reference
 counted, so two containers in one page would unlock each other on drop.
 The cost is one page of `RLIMIT_MEMLOCK` per container, two per open
-`Vault`; a failed `mlock` is reported as an error rather than degraded to
-unlocked memory.
+`Vault`, and briefly four while `change_password` (or the re-keying of a
+version 1 file inside `open`) holds the old and the new index together; a
+failed `mlock` is reported as an error rather than degraded to unlocked
+memory.
 
 The subkeys are kept in the clear inside the locked pages. Releases up to
 0.2.1 encrypted them in memory under a per-container stream key, but that
 key had to live in memory with the same protection as the ciphertext, so
 the layer protected nothing against a reader of the pages and cost an
 AEAD operation on every key use. The raw master key is zeroized as soon
-as the subkeys are derived; `open()` derives them exactly once.
+as the subkeys are derived; `open()` derives them once per header, which
+means twice for a version 1 file (the second time under the new header
+chosen by the in-memory re-keying of section 12). HKDF writes the subkeys
+straight into zeroizing buffers, and the Argon2id memory matrix is owned
+by `derive_master_key` and wiped on drop: its last block is one hash away
+from the master key, and the `argon2` crate's own allocating entry point
+frees the matrix without clearing it.
 
 
 ## 5. Nonce generation
@@ -253,7 +271,18 @@ entry_count times:
 Nothing follows the last entry. Overhead is 22 bytes for the preamble and
 48 bytes per entry, so the file size is the sum of the ciphertexts plus
 a few hundred bytes; in format version 1 the same data cost about 3.6
-bytes per ciphertext byte (section 12).
+bytes per ciphertext byte (section 12). Measured against the plaintext
+secrets, each entry costs 128 bytes plus the length of its name: 48 bytes
+of index fields plus a 24-byte nonce and a 16-byte tag for each of the two
+ciphertexts.
+
+After decoding, `open` also checks that `data_nonce_counter` is strictly
+greater than every stored `data_counter`. The counter is bound into the
+entry AAD (section 6); a vault written by this library always advances it
+past every stored entry, so a violation means the authenticated index is
+inconsistent and is reported as `CorruptedData` rather than letting a
+later `store` reissue a `(name, counter)` pair under which an older
+ciphertext for that name could be replayed.
 
 The entry keys are HMAC-SHA256 of plaintext entry names. This prevents
 leaking entry names through the serialized vault. Entry name lookup at
@@ -306,10 +335,11 @@ Limits:
 * `MAX_ENTRY_NAME_LEN = 255` bytes.
 * `MAX_ENTRY_DATA_SIZE = 64 MiB`.
 
-The aggregate bound is the file bound: total stored ciphertext plus about
-50 bytes per entry must stay under `MAX_VAULT_FILE_SIZE`, so a vault holds
-a little under 256 MiB of secrets in total, and `Vault::export` fails
-cleanly rather than producing a file that `Vault::load` would refuse.
+The aggregate bound is the file bound: total stored secrets plus 128
+bytes and the name length per entry (section 7) must stay under
+`MAX_VAULT_FILE_SIZE`, so a vault holds a little under 256 MiB of secrets
+in total, and `Vault::export` fails cleanly rather than producing a file
+that `Vault::load` would refuse.
 
 
 ## 9. Known oddities (current format)
@@ -318,10 +348,12 @@ cleanly rather than producing a file that `Vault::load` would refuse.
 
 As noted in section 3, the AAD used for index encryption is the bytes
 returned by `serde_json::to_vec(&header)` at encryption time, and at
-open() the same call is made on the deserialized header. Both
-serializations are produced by the same code path so they agree, but a
-hand-edited header file with semantically-equal but textually-different
-JSON would not round-trip.
+open() the same call is made on the deserialized header. The file is
+required to carry exactly those bytes, so a hand-edited header with
+semantically-equal but textually-different JSON is rejected as
+`CorruptedData` rather than silently accepted with unauthenticated bytes.
+A third party that re-encodes the header must reproduce `serde_json`'s
+compact output with the fields in declaration order.
 
 
 ## 10. Bounded parsing summary
@@ -354,11 +386,14 @@ parameters taken from the unauthenticated header. The bounds above cap
 what a forged file can make `open()` or `load()` spend before it is
 rejected:
 
+* at most 256 MiB of input is accepted at all, by `load()` on the file
+  and by `open()` on the bytes;
 * at most 4 KiB of header JSON is parsed;
-* at most one Argon2id derivation with a 256 MiB working set and 10
-  passes, which is also the size of the largest file `load()` reads
-  (a version 1 file costs a second derivation, Argon2id this time, only
-  after it has authenticated: section 12);
+* at most one Argon2 derivation (Argon2id, or Argon2i if the forged
+  header claims version 1) with a 256 MiB working set and 10 passes,
+  which is also the size of the largest input accepted (a genuine version
+  1 file costs a second derivation, Argon2id this time, only after it has
+  authenticated: section 12);
 * HKDF and one AEAD verification over at most 256 MiB of ciphertext,
   then one linear pass over the decrypted index.
 
@@ -405,8 +440,8 @@ the header `version` field and handle them explicitly. The one thing it
 MUST NOT do is silently re-interpret older bytes as the current format:
 that path leads to wrong-key derivation, AAD mismatches, or worst-case
 incoherent reads that surface as ambiguous errors. Detection is cheap
-(the `version` field is the second u16 read after `header_len`) and
-mandatory.
+(the `version` field of the plaintext header JSON is read before anything
+else is interpreted) and mandatory.
 
 How to handle a detected older version is a design choice; see the next
 section.

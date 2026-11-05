@@ -61,20 +61,22 @@ pub struct VaultIndex {
     hmac_key: LockedSecret,
 }
 
-/// Derives separate encryption and HMAC subkeys from a master key via HKDF-SHA256.
+/// Derives separate encryption and HMAC subkeys from a master key via
+/// HKDF-SHA256, writing them into buffers the caller owns. Taking output
+/// buffers instead of returning arrays keeps the subkeys from being copied
+/// through unwiped stack slots: the caller passes `Zeroizing` buffers and
+/// no other copy of the subkeys ever exists.
 pub fn derive_subkeys(
     master_key: &[u8],
     salt: &[u8],
-) -> Result<([u8; SUBKEY_LEN], [u8; SUBKEY_LEN]), IndexError> {
-    let mut enc_sub = [0u8; SUBKEY_LEN];
-    hkdf::sha256::derive_key(salt, master_key, Some(ENCRYPTION_SUBKEY_INFO), &mut enc_sub)
+    enc_out: &mut [u8; SUBKEY_LEN],
+    hmac_out: &mut [u8; SUBKEY_LEN],
+) -> Result<(), IndexError> {
+    hkdf::sha256::derive_key(salt, master_key, Some(ENCRYPTION_SUBKEY_INFO), enc_out)
         .map_err(|e| IndexError::Crypto(format!("HKDF enc subkey failed: {}", e)))?;
-
-    let mut hmac_sub = [0u8; SUBKEY_LEN];
-    hkdf::sha256::derive_key(salt, master_key, Some(HMAC_SUBKEY_INFO), &mut hmac_sub)
+    hkdf::sha256::derive_key(salt, master_key, Some(HMAC_SUBKEY_INFO), hmac_out)
         .map_err(|e| IndexError::Crypto(format!("HKDF hmac subkey failed: {}", e)))?;
-
-    Ok((enc_sub, hmac_sub))
+    Ok(())
 }
 
 impl VaultIndex {
@@ -115,15 +117,17 @@ impl VaultIndex {
 
     /// Returns the map key for a plaintext entry name: HMAC-SHA256 of the
     /// name under the HMAC subkey, hex encoded. The same string is bound into
-    /// the entry AAD.
-    pub fn hmac_key_for_name(&self, plaintext_name: &str) -> Result<String, IndexError> {
+    /// the entry AAD. The key is pseudonymous rather than secret, but it is
+    /// still wiped on drop so that freed memory does not accumulate a record
+    /// of which names were looked up.
+    pub fn hmac_key_for_name(&self, plaintext_name: &str) -> Result<Zeroizing<String>, IndexError> {
         let tag = self.hmac_key.with_bytes(|key_bytes| {
             let hmac_key = HmacSecretKey::from_slice(key_bytes)
                 .map_err(|_| IndexError::Crypto("HMAC key invalid".to_string()))?;
             HmacSha256::hmac(&hmac_key, plaintext_name.as_bytes())
                 .map_err(|_| IndexError::Crypto("HMAC failed".to_string()))
         })?;
-        Ok(key_to_hex(tag.unprotected_as_bytes()))
+        Ok(Zeroizing::new(key_to_hex(tag.unprotected_as_bytes())))
     }
 
     /// Inserts an entry under an already computed `hmac_key_for_name` key.
@@ -131,15 +135,22 @@ impl VaultIndex {
     /// zeroizes its encrypted fields.
     pub fn insert_by_key(
         &mut self,
-        hashed_key: String,
+        mut hashed_key: Zeroizing<String>,
         entry: IndexEntry,
     ) -> Result<(), IndexError> {
-        // The cap applies to the map size; overwriting an existing entry does
-        // not grow the map and stays allowed at the cap.
-        if self.files.len() >= MAX_INDEX_ENTRIES && !self.files.contains_key(&hashed_key) {
+        // Overwrite in place so the map keeps its existing key and the
+        // duplicate stays inside `hashed_key`, which wipes it on drop. This
+        // also keeps overwrites allowed at the cap: the map does not grow.
+        if let Some(slot) = self.files.get_mut(hashed_key.as_str()) {
+            *slot = entry;
+            return Ok(());
+        }
+        if self.files.len() >= MAX_INDEX_ENTRIES {
             return Err(IndexError::Full(MAX_INDEX_ENTRIES));
         }
-        self.files.insert(hashed_key, entry);
+        // Move the String out of its wrapper (no copy of the heap buffer);
+        // the map now owns it and `VaultIndex::drop` wipes it.
+        self.files.insert(std::mem::take(&mut *hashed_key), entry);
         Ok(())
     }
 
@@ -148,17 +159,19 @@ impl VaultIndex {
         self.files.get(hashed_key)
     }
 
-    /// Removes an entry by its `hmac_key_for_name` key. Returns the entry if
-    /// it existed.
+    /// Removes an entry by its `hmac_key_for_name` key, wiping the stored
+    /// key. Returns the entry if it existed.
     pub fn remove_by_key(&mut self, hashed_key: &str) -> Option<IndexEntry> {
-        self.files.remove(hashed_key)
+        let (mut key, entry) = self.files.remove_entry(hashed_key)?;
+        key.zeroize();
+        Some(entry)
     }
 
     /// Creates a new empty index from an externally-derived master key and salt.
     pub fn from_master_key(master_key: &[u8], salt: &[u8]) -> Result<Self, IndexError> {
-        let (enc_sub, hmac_sub) = derive_subkeys(master_key, salt)?;
-        let enc_sub = Zeroizing::new(enc_sub);
-        let hmac_sub = Zeroizing::new(hmac_sub);
+        let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
+        derive_subkeys(master_key, salt, &mut enc_sub, &mut hmac_sub)?;
 
         let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
         secure_bytes_fill(&mut nonce)?;
@@ -255,7 +268,9 @@ mod tests {
         data_nonce_counter: u64,
         files: HashMap<String, IndexEntry>,
     ) -> Result<VaultIndex, IndexError> {
-        let (enc_sub, hmac_sub) = derive_subkeys(master, salt).unwrap();
+        let mut enc_sub = [0u8; SUBKEY_LEN];
+        let mut hmac_sub = [0u8; SUBKEY_LEN];
+        derive_subkeys(master, salt, &mut enc_sub, &mut hmac_sub).unwrap();
         VaultIndex::from_subkeys_and_data(
             &enc_sub,
             &hmac_sub,
@@ -356,21 +371,47 @@ mod tests {
         assert_eq!(idx.remove_by_key(&key), None);
     }
 
+    fn subkeys(master: &[u8]) -> ([u8; SUBKEY_LEN], [u8; SUBKEY_LEN]) {
+        let mut enc = [0u8; SUBKEY_LEN];
+        let mut hmac = [0u8; SUBKEY_LEN];
+        derive_subkeys(master, &[], &mut enc, &mut hmac).unwrap();
+        (enc, hmac)
+    }
+
     #[test]
     fn subkeys_are_deterministic_for_same_master() {
         let master = [0xABu8; 32];
-        let (enc1, hmac1) = derive_subkeys(&master, &[]).unwrap();
-        let (enc2, hmac2) = derive_subkeys(&master, &[]).unwrap();
+        let (enc1, hmac1) = subkeys(&master);
+        let (enc2, hmac2) = subkeys(&master);
         assert_eq!(enc1, enc2);
         assert_eq!(hmac1, hmac2);
+        assert_ne!(enc1, hmac1);
     }
 
     #[test]
     fn subkeys_differ_for_different_masters() {
-        let (enc1, hmac1) = derive_subkeys(&[0x01u8; 32], &[]).unwrap();
-        let (enc2, hmac2) = derive_subkeys(&[0x02u8; 32], &[]).unwrap();
+        let (enc1, hmac1) = subkeys(&[0x01u8; 32]);
+        let (enc2, hmac2) = subkeys(&[0x02u8; 32]);
         assert_ne!(enc1, enc2);
         assert_ne!(hmac1, hmac2);
+    }
+
+    #[test]
+    fn overwrite_keeps_one_entry_and_is_allowed_at_the_cap() {
+        let mut idx = VaultIndex::generate().unwrap();
+        for i in 0..MAX_INDEX_ENTRIES {
+            idx.insert_named(&format!("entry-{i}"), entry_with_counter(i as u64))
+                .unwrap();
+        }
+        assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
+        idx.insert_named("entry-0", entry_with_counter(9999))
+            .unwrap();
+        assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
+        assert_eq!(idx.lookup_named("entry-0").unwrap().data_counter, 9999);
+        assert!(matches!(
+            idx.insert_named("one-too-many", entry_with_counter(1)),
+            Err(IndexError::Full(MAX_INDEX_ENTRIES))
+        ));
     }
 
     #[test]

@@ -115,11 +115,12 @@ fn main() -> Result<(), VaultError> {
 | Header JSON | Maximum 4 KiB |
 | KDF parameters accepted by `open()` | 32 MiB to 256 MiB memory, 3 to 10 iterations |
 
-The 256 MiB file bound is enforced on both sides: `load()` refuses larger
-files and `export()`/`save()` refuse to produce them. The index is a
-compact binary encoding (about 50 bytes of overhead per entry), so the
-bound on total stored secrets is a little under 256 MiB; `export()` fails
-cleanly when it is exceeded and the vault stays usable.
+The 256 MiB file bound is enforced on both sides: `load()` and `open()`
+refuse larger input and `export()`/`save()` refuse to produce it. The
+index is a compact binary encoding (128 bytes plus the name length per
+entry, on top of the secret itself), so the bound on total stored secrets
+is a little under 256 MiB; `export()` fails cleanly when it is exceeded
+and the vault stays usable.
 
 Vault files written by releases up to 0.2.1 (format version 1: JSON index,
 Argon2i) are still opened transparently. Opening one costs a second key
@@ -157,7 +158,7 @@ fn main() {
 
 | Variant | Meaning |
 |---------|---------|
-| `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault. |
+| `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault. Also returned by `change_password()` when the current password does not match. |
 | `InvalidInput(String)` | An argument violated a documented limit: password shorter than 8 bytes, entry name over 255 bytes, entry data over 64 MiB, or a new name when the vault already holds 1024 entries. |
 | `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, index version, entry count, entry sizes), or the authenticated index is internally inconsistent. |
 | `CryptoError(String)` | A cryptographic or random-number operation failed, or locked memory for the subkeys could not be allocated. |
@@ -175,6 +176,11 @@ Upgrading from 0.2.1: `InvalidKey` is removed (it could not be returned
 either), limit violations now surface as `InvalidInput` instead of
 `CryptoError`, and an inconsistent counter in an otherwise authenticated
 index is reported by `open()` as `CorruptedData` instead of `CryptoError`.
+Two things outside the error type also change: a vault file is rewritten
+in format version 2 the first time it is saved by 0.3.0, and 0.2.1 cannot
+read that format, so keep a backup of each file before upgrading an
+application that may need to roll back; and the minimum supported Rust
+version is now 1.88.
 
 ## Handling Plaintext
 
@@ -295,7 +301,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed, including inside a `with_secret()` callback, or after it has been returned by `retrieve()`. |
 | **Caller-owned plaintext leaks** | `with_secret()` keeps the library-owned buffer scoped to a callback and zeroizes it afterward, but cannot prevent the callback from making copies. `retrieve()` returns `Vec<u8>` directly. The caller remains responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
 | **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. This includes the timing difference between a hit and a miss in `retrieve()`/`with_secret()`, which reveals whether a name exists to anyone who can time calls. |
-| **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `memsec`, and `zeroize`. |
+| **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `argon2`, `memsec`, and `zeroize`. |
 | **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |
 | **Full swap protection** | Only the two `LockedSecret` allocations that hold the subkeys are locked. Transient copies made during each operation, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
 | **Rollback protection** | memseal does not provide rollback protection. An attacker who can replace a vault file with an older valid copy can cause the application to load older data unless the application stores freshness/version information externally. |
@@ -334,7 +340,7 @@ Index encryption:
   vault header is authenticated as AAD
 ```
 
-Note: `mlock` is applied only to the two `LockedSecret` allocations that hold the subkeys. The subkeys are stored in the clear inside those locked pages: encrypting them in memory would need a key with the same protection, so it would add nothing an attacker who can read the pages does not already get. The lock does not cover every secret-related allocation. Each container occupies at least one page of its own, so every open `Vault` holds two locked pages (8 KiB with 4 KiB pages) against `RLIMIT_MEMLOCK`; `Vault::create`, `open`, and `load` fail with `CryptoError` when the limit is exhausted rather than fall back to unlocked memory.
+Note: `mlock` is applied only to the two `LockedSecret` allocations that hold the subkeys. The subkeys are stored in the clear inside those locked pages: encrypting them in memory would need a key with the same protection, so it would add nothing an attacker who can read the pages does not already get. The lock does not cover every secret-related allocation. Each container occupies at least one page of its own, so every open `Vault` holds two locked pages (8 KiB with 4 KiB pages) against `RLIMIT_MEMLOCK`, and `change_password()` briefly needs four while the old and the new index coexist (so does `open()` on a file written by 0.2.1, which is re-keyed the same way). `Vault::create`, `open`, `load`, and `change_password` fail with `CryptoError` when the limit is exhausted rather than fall back to unlocked memory.
 
 ## Cryptographic Primitives
 
@@ -398,10 +404,11 @@ public API and must never be enabled by a dependency. See `fuzz/README.md`.
 
 GitHub Actions runs on every push and PR to `main`:
 
-- `cargo check --all-targets`
+- `cargo check --all-targets`, with and without `--features fuzzing`
 - `cargo fmt --all -- --check`
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`, with and without `--features fuzzing`
 - `cargo test`
+- `cargo check --all-targets --locked` on the MSRV toolchain (1.88)
 - `rustsec/audit-check` action
 
 ## MSRV

@@ -425,8 +425,8 @@ pub(crate) mod tests {
         assert_eq!(decoded.nonce_counter, 7);
         assert_eq!(decoded.data_nonce_counter, 3);
         assert_eq!(decoded.files.len(), 2);
-        assert_eq!(decoded.files[&k1], entry(1, 40, 40));
-        assert_eq!(decoded.files[&k2], entry(2, 100, 5000));
+        assert_eq!(decoded.files[k1.as_str()], entry(1, 40, 40));
+        assert_eq!(decoded.files[k2.as_str()], entry(2, 100, 5000));
     }
 
     #[test]

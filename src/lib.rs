@@ -50,7 +50,11 @@ mod crypto;
 mod mem;
 mod vault;
 
+/// Entry points for the `fuzz/` crate. Not part of the public API: the
+/// `fuzzing` feature exists only so the fuzz targets can reach the
+/// untrusted-input parsers, and no dependency should enable it.
 #[cfg(feature = "fuzzing")]
+#[doc(hidden)]
 pub mod fuzzing;
 
 pub use vault::facade::Vault;

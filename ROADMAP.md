@@ -13,13 +13,13 @@
 - Add a callback-based access API for short-lived plaintext use.
 - Keep `retrieve()` for convenience, but document it as caller-owned plaintext.
 - Improve examples around plaintext handling.
+
+## 0.3.x - KDF configuration and review
+
 - Done: format version 2 drops the unread 8-byte `nonce_counter` from the
   envelope and replaces the JSON index with a length-prefixed binary
   encoding (see `DESIGN.md` sections 7 and 12). Version 1 files are read
   and rewritten on the next save.
-
-## 0.3.x - KDF configuration and review
-
 - Done: format version 2 uses Argon2id (RustCrypto `argon2`); version 1
   files are re-keyed on open (see `DESIGN.md` sections 4 and 12).
 - Add safe KDF configuration options.

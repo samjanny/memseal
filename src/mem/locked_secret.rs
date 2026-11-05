@@ -186,24 +186,40 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn dropping_one_container_keeps_the_other_locked() {
-        fn locked_kb() -> u64 {
-            let smaps = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
-            smaps
-                .lines()
-                .find_map(|line| line.strip_prefix("Locked:"))
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|kb| kb.parse().ok())
-                .expect("Locked: line in smaps_rollup")
+        /// Whether the mapping that contains `addr` carries the `lo`
+        /// (locked) VM flag in `/proc/self/smaps`. Checking the specific
+        /// mapping, rather than the process-wide `Locked:` total, keeps the
+        /// test meaningful while other tests hold locked pages in parallel.
+        fn mapping_is_locked(addr: usize) -> bool {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut in_range = false;
+            for line in smaps.lines() {
+                if let Some((range, _)) = line.split_once(' ')
+                    && let Some((start, end)) = range.split_once('-')
+                    && let (Ok(start), Ok(end)) = (
+                        usize::from_str_radix(start, 16),
+                        usize::from_str_radix(end, 16),
+                    )
+                {
+                    in_range = start <= addr && addr < end;
+                    continue;
+                }
+                if in_range && let Some(flags) = line.strip_prefix("VmFlags:") {
+                    return flags.split_whitespace().any(|f| f == "lo");
+                }
+            }
+            panic!("no smaps mapping contains {addr:#x}");
         }
 
         let a = LockedSecret::new(&[1u8; 32]).unwrap();
         let b = LockedSecret::new(&[2u8; 32]).unwrap();
-        assert!(locked_kb() >= 4);
+        let addr_b = b.region.as_slice().as_ptr() as usize;
+        assert!(mapping_is_locked(addr_b));
         drop(a);
-        // `b` still holds at least one locked page. Other tests may add
-        // locked pages concurrently, so this is a lower bound.
+        // munlock is not reference counted: `b`'s page must still be
+        // locked after its neighbour is freed.
         assert!(
-            locked_kb() >= 4,
+            mapping_is_locked(addr_b),
             "dropping one container unlocked the other"
         );
         b.with_bytes(|bytes| assert_eq!(bytes, &[2u8; 32]));

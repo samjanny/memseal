@@ -17,6 +17,9 @@ pub enum VaultError {
     /// all of them. Treat it as "authentication failed" rather than as proof
     /// that the password was mistyped, and keep in mind that every retry
     /// repeats the Argon2 derivation on the same bytes.
+    ///
+    /// `change_password` returns the same variant when the current password
+    /// does not reproduce the keys in memory; no AEAD is involved there.
     #[error("Vault authentication failed: wrong password or tampered data")]
     InvalidPassword,
     /// An argument violated a documented limit: the password is shorter than
