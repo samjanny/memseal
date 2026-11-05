@@ -10,9 +10,13 @@ fn bench_vault_create(c: &mut Criterion) {
 fn bench_vault_store(c: &mut Criterion) {
     let mut vault = Vault::create(b"benchmark-password").unwrap();
     c.bench_function("Vault::store", |b| {
+        // Cycle through fewer names than MAX_INDEX_ENTRIES (1024): criterion
+        // runs far more iterations than that, and a fresh name on every call
+        // would hit the entry cap and fail. After the first pass the calls
+        // overwrite existing entries, which is still the store() path.
         let mut i = 0u64;
         b.iter(|| {
-            let name = format!("key_{}", i);
+            let name = format!("key_{}", i % 1000);
             vault.store(&name, b"benchmark-value-data").unwrap();
             i += 1;
         });
