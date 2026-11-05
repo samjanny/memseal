@@ -276,7 +276,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
 | **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap or whose entries are larger than `store()` can produce. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
-| **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `SecureMemoryVault`: it is encrypted under a fresh stream key, and the key, its nonce, and the ciphertext share one allocation locked with `mlock` via `memsec` where supported (on Linux also excluded from core dumps) and zeroized on drop. |
+| **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `SecureMemoryVault`: it is encrypted under a fresh stream key, and the key, its nonce, and the ciphertext share one `memsec` allocation that occupies pages of its own, sits between guard pages, is locked with `mlock` where supported (on Linux also excluded from core dumps), and is zeroized on drop. |
 
 ### Out of scope / limitations
 
@@ -325,7 +325,7 @@ Index encryption:
   vault header is authenticated as AAD
 ```
 
-Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold the two subkeys (each one stream key, nonce, and ciphertext). It does not lock every secret-related allocation.
+Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold the two subkeys (each one stream key, nonce, and ciphertext). It does not lock every secret-related allocation. Each container occupies at least one page of its own, so every open `Vault` holds two locked pages (8 KiB with 4 KiB pages) against `RLIMIT_MEMLOCK`; `Vault::create`, `open`, and `load` fail with `CryptoError` when the limit is exhausted rather than fall back to unlocked memory.
 
 ## Cryptographic Primitives
 
@@ -342,7 +342,7 @@ Note: `mlock` is applied only to the `SecureMemoryVault` allocations that hold t
 ## Security Properties
 
 - **Small public API.** The crate exposes `Vault` and `VaultError`; internal modules are private.
-- **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for the `mlock`/`munlock` calls only; it keeps no raw pointers, so `Send`/`Sync` need no `unsafe impl`.
+- **Unsafe code is isolated.** The crate uses `#![deny(unsafe_code)]` at the crate root. The memory-locking module explicitly allows unsafe code for the `memsec` allocation and locking calls and for the `Send`/`Sync` impls of the type that uniquely owns each locked region.
 - **Domain separation.** Subkey derivation uses distinct HKDF `info` labels for the encryption and HMAC keys.
 - **Authenticated encryption.** Vault index data and entries are encrypted with AEAD.
 - **Bounded parsing.** Untrusted vault data is checked against size and parameter bounds before processing; a hostile file can cost at most one bounded Argon2i derivation (256 MiB, 10 passes) before it is rejected.

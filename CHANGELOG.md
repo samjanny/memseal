@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+* `SecureMemoryVault` now allocates its locked region with `memsec::malloc_sized`, which places the bytes in pages no other allocation shares, between two guard pages. Previously the region was an ordinary `Vec` of about 100 bytes, so two containers (for example the subkeys of two open vaults) routinely landed in the same page; since `munlock` is not reference counted, dropping one vault silently unlocked the subkeys of the other while `is_locked()` still reported `true`. Each container now costs one page of `RLIMIT_MEMLOCK` (two per open `Vault`), and a failed `mlock` is still reported as an error.
+
 ### Changed
 
 * Removed internal code that no `Vault` operation used: the bounded random integer helpers, the `SecureConstructor`/`SecureAccess` traits with their `EncryptionError`, the `NonceRotation` type-state on `VaultIndex`, `VaultIndex::generate`, `from_master_key_and_data`, `generate_dummy`, the unused `kdf_salt` copy held by the index, and `SecureMemoryVault::{safe_new, len, is_empty}`. The `secrecy` dependency went with the traits. The crate-level `#![allow(dead_code)]` is gone, so unused items now fail the clippy job in CI. The public API is unchanged.

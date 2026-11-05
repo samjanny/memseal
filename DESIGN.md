@@ -147,9 +147,15 @@ Both subkeys are stored in `SecureMemoryVault` for the lifetime of the
 `Vault`. Each container encrypts its subkey under a fresh in-memory
 XChaCha20-Poly1305 stream key and keeps that key, its nonce, and the
 ciphertext in a single `mlock`'d allocation (on Linux also marked
-`MADV_DONTDUMP` by `memsec`), which is zeroized on drop. The raw master
-key is zeroized as soon as the subkeys are derived; `open()` derives them
-exactly once.
+`MADV_DONTDUMP` by `memsec`), which is zeroized on drop. The allocation
+comes from `memsec::malloc_sized`, so it occupies pages no other
+allocation shares and sits between two guard pages. Page exclusivity is
+required for the lock to mean anything: `munlock` is not reference
+counted, so two containers in one page would unlock each other on drop.
+The cost is one page of `RLIMIT_MEMLOCK` per container, two per open
+`Vault`; a failed `mlock` is reported as an error rather than degraded to
+unlocked memory. The raw master key is zeroized as soon as the subkeys
+are derived; `open()` derives them exactly once.
 
 
 ## 5. Nonce generation

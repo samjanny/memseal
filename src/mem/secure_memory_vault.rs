@@ -2,21 +2,20 @@
 //! In-memory container for the vault's 32-byte subkeys.
 //!
 //! The plaintext is encrypted with a fresh streaming XChaCha20-Poly1305 key
-//! and kept in one heap allocation together with that key and its nonce. The
-//! whole allocation is `mlock`'d for the container's lifetime (on Linux
-//! `memsec` also excludes it from core dumps) and zeroized on drop, so the
-//! key that decrypts the buffer gets the same protection as the buffer.
+//! and kept together with that key and its nonce in one [`LockedRegion`]: a
+//! `memsec` allocation that occupies pages no other allocation shares, sits
+//! between two guard pages, is `mlock`'d for the container's lifetime (on
+//! Linux `memsec` also excludes it from core dumps), and is zeroized on
+//! drop. The key that decrypts the buffer gets the same protection as the
+//! buffer, and unlocking one container can never unlock another.
 use crate::constants::SECURE_MEMORY_VAULT_CHUNK_SIZE;
 use crate::crypto::utils::secure_bytes_fill;
-use memsec::{mlock, munlock};
 use orion::hazardous::aead::streaming::{ABYTES, StreamTag, StreamXChaCha20Poly1305};
 use orion::hazardous::stream::chacha20::{CHACHA_KEYSIZE, SecretKey};
 use orion::hazardous::stream::xchacha20::{Nonce, XCHACHA_NONCESIZE};
 use std::fmt::Debug;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::ptr::NonNull;
+use std::sync::Mutex;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -31,6 +30,9 @@ pub enum MemoryVaultError {
     /// Error during cryptographic operations.
     #[error("crypto error")]
     Crypto,
+    /// Error when allocating the locked region.
+    #[error("locked memory allocation failed")]
+    Alloc,
     /// Error when locking memory using `mlock`.
     #[error("memsec lock failed")]
     Lock,
@@ -47,103 +49,122 @@ impl From<&'static str> for MemoryVaultError {
     }
 }
 
+/// A heap allocation that lives in its own `mlock`'d pages.
+///
+/// `memsec::malloc_sized` returns bytes placed in pages no other allocation
+/// shares, with a guard page on each side and a canary that `free` checks.
+/// Page exclusivity is what makes the lock reliable: `munlock` is not
+/// reference counted, so two containers in one page would unlock each other
+/// on drop. Each region therefore costs at least one page of
+/// `RLIMIT_MEMLOCK`.
+struct LockedRegion {
+    ptr: NonNull<[u8]>,
+}
+
+// SAFETY: `LockedRegion` is the unique owner of the allocation behind `ptr`.
+// Shared access hands out `&[u8]` through `&self`, mutation needs
+// `&mut self`, and `free` runs exactly once from `Drop`. The pointer is never
+// copied out or shared with another owner, so moving the region between
+// threads or reading it from several threads is as sound as for `Box<[u8]>`.
+unsafe impl Send for LockedRegion {}
+unsafe impl Sync for LockedRegion {}
+
+impl LockedRegion {
+    /// Allocates `len` zeroed bytes in locked, page-exclusive memory.
+    fn new(len: usize) -> Result<Self, MemoryVaultError> {
+        debug_assert!(len > 0, "LockedRegion must not be empty");
+
+        // SAFETY: `malloc_sized` initializes memsec's page size and canary on
+        // first use and returns a pointer valid for `len` bytes until `free`.
+        let ptr = unsafe { memsec::malloc_sized(len) }.ok_or(MemoryVaultError::Alloc)?;
+
+        // `malloc_sized` calls `mlock` on the pages but discards the result.
+        // Lock again so that a failure (for example an exhausted
+        // RLIMIT_MEMLOCK) is reported instead of silently leaving the bytes
+        // swappable; locking an already locked range is a no-op.
+        //
+        // SAFETY: `ptr` is valid for `len` bytes and `free` is the matching
+        // release for a `malloc_sized` pointer.
+        let locked = unsafe { memsec::mlock(ptr.as_ptr() as *mut u8, len) };
+        if !locked {
+            unsafe { memsec::free(ptr) };
+            return Err(MemoryVaultError::Lock);
+        }
+
+        // memsec fills new allocations with a garbage pattern.
+        let mut region = Self { ptr };
+        region.as_mut_slice().fill(0);
+        Ok(region)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is valid and uniquely owned for the lifetime of
+        // `self`; the returned borrow is tied to `&self`.
+        unsafe { self.ptr.as_ref() }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as above, with `&mut self` guaranteeing no other borrow.
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl Drop for LockedRegion {
+    fn drop(&mut self) {
+        // Wipe while the pages are still locked. `free` zeroes and unlocks
+        // the pages again, verifies the canary, and releases the allocation.
+        self.as_mut_slice().zeroize();
+        // SAFETY: `ptr` came from `malloc_sized` and is freed exactly once.
+        unsafe { memsec::free(self.ptr) };
+    }
+}
+
 /// A secure memory vault for encrypting and storing sensitive data in memory.
 ///
-/// Layout of `region`, a single `mlock`'d allocation:
+/// Layout of `region`, a single locked allocation:
 ///
 /// ```text
 /// [ stream key (32) | stream nonce (24) | ciphertext chunk 0 | chunk 1 | ... ]
 /// ```
 ///
 /// Each ciphertext chunk carries the streaming AEAD's 17-byte overhead. The
-/// region is empty when the plaintext was empty. No raw pointers are kept, so
-/// `Send` and `Sync` follow from the field types without `unsafe impl`s.
+/// region is absent when the plaintext was empty.
 pub struct SecureMemoryVault {
-    region: Vec<u8>,
-    /// Length passed to `mlock`, reused for `munlock` in `Drop`.
-    locked_len: usize,
+    region: Option<LockedRegion>,
     chunk_size: usize,
     plaintext_len: usize,
-    is_locked: AtomicBool,
     sync: Mutex<()>,
 }
 
 impl SecureMemoryVault {
     /// Encrypts `plaintext` in memory using streaming XChaCha20-Poly1305 and
-    /// keeps key, nonce, and ciphertext in one `mlock`'d allocation.
+    /// keeps key, nonce, and ciphertext in one locked allocation.
     pub fn new(plaintext: &[u8]) -> Result<Self, MemoryVaultError> {
         let chunk_size = SECURE_MEMORY_VAULT_CHUNK_SIZE;
         if plaintext.is_empty() {
             return Ok(Self {
-                region: Vec::new(),
-                locked_len: 0,
+                region: None,
                 chunk_size,
                 plaintext_len: 0,
-                is_locked: AtomicBool::new(false),
                 sync: Mutex::new(()),
             });
         }
 
         let num_chunks = plaintext.len().div_ceil(chunk_size);
         let region_len = CIPHERTEXT_OFFSET + plaintext.len() + num_chunks * ABYTES;
-        let mut vault = Self {
-            region: vec![0u8; region_len],
-            locked_len: 0,
+
+        // The region is locked before any secret is written, so the stream
+        // key never touches an unlocked page. From here on any error drops
+        // `region`, whose Drop zeroizes and releases it.
+        let mut region = LockedRegion::new(region_len)?;
+        seal_into(region.as_mut_slice(), chunk_size, plaintext)?;
+
+        Ok(Self {
+            region: Some(region),
             chunk_size,
             plaintext_len: plaintext.len(),
-            is_locked: AtomicBool::new(false),
             sync: Mutex::new(()),
-        };
-
-        // Lock before any secret is written so the stream key never touches
-        // an unlocked page. The region holds only zeros at this point, so a
-        // failure here can simply drop it.
-        if !unsafe { mlock(vault.region.as_mut_ptr(), region_len) } {
-            return Err(MemoryVaultError::Lock);
-        }
-        vault.locked_len = region_len;
-        vault.is_locked.store(true, Ordering::SeqCst);
-
-        // From here on any error drops `vault`, whose Drop zeroizes and
-        // unlocks the region.
-        vault.seal_into_region(plaintext)?;
-        Ok(vault)
-    }
-
-    /// Generates the stream key and nonce directly inside the locked region
-    /// and seals `plaintext` after them, chunk by chunk.
-    fn seal_into_region(&mut self, plaintext: &[u8]) -> Result<(), MemoryVaultError> {
-        let chunk_size = self.chunk_size;
-        let (prefix, ciphertext) = self.region.split_at_mut(CIPHERTEXT_OFFSET);
-        let (key_bytes, nonce_bytes) = prefix.split_at_mut(NONCE_OFFSET);
-        secure_bytes_fill(key_bytes)?;
-        secure_bytes_fill(nonce_bytes)?;
-
-        // orion copies the key into its own (zeroize-on-drop) types for the
-        // duration of the operation; the long-lived copy stays in the region.
-        let key = SecretKey::from_slice(key_bytes).map_err(|_| MemoryVaultError::Crypto)?;
-        let nonce = Nonce::from_slice(nonce_bytes).map_err(|_| MemoryVaultError::Crypto)?;
-        let mut encr = StreamXChaCha20Poly1305::new(&key, &nonce);
-
-        let num_chunks = plaintext.len().div_ceil(chunk_size);
-        let mut ct_offset = 0;
-        for (i, chunk) in plaintext.chunks(chunk_size).enumerate() {
-            let tag = if i + 1 == num_chunks {
-                StreamTag::Finish
-            } else {
-                StreamTag::Message
-            };
-            let out_len = chunk.len() + ABYTES;
-            encr.seal_chunk(
-                chunk,
-                None,
-                &mut ciphertext[ct_offset..ct_offset + out_len],
-                &tag,
-            )
-            .map_err(|_| MemoryVaultError::Crypto)?;
-            ct_offset += out_len;
-        }
-        Ok(())
+        })
     }
 
     /// Decrypts the data and passes each chunk to `f`.
@@ -154,20 +175,21 @@ impl SecureMemoryVault {
     where
         F: FnMut(&[u8], StreamTag) -> Result<(), MemoryVaultError>,
     {
-        if self.plaintext_len == 0 {
+        let Some(region) = &self.region else {
             return f(&[], StreamTag::Finish);
-        }
+        };
         let _g = self
             .sync
             .lock()
             .map_err(|_| MemoryVaultError::MutexLockFailed)?;
 
-        let key = SecretKey::from_slice(&self.region[..NONCE_OFFSET])
-            .map_err(|_| MemoryVaultError::Crypto)?;
-        let nonce = Nonce::from_slice(&self.region[NONCE_OFFSET..CIPHERTEXT_OFFSET])
+        let bytes = region.as_slice();
+        let key =
+            SecretKey::from_slice(&bytes[..NONCE_OFFSET]).map_err(|_| MemoryVaultError::Crypto)?;
+        let nonce = Nonce::from_slice(&bytes[NONCE_OFFSET..CIPHERTEXT_OFFSET])
             .map_err(|_| MemoryVaultError::Crypto)?;
         let mut reader = StreamXChaCha20Poly1305::new(&key, &nonce);
-        let ciphertext = &self.region[CIPHERTEXT_OFFSET..];
+        let ciphertext = &bytes[CIPHERTEXT_OFFSET..];
 
         let buf_size = self.plaintext_len.min(self.chunk_size);
         let mut out = Zeroizing::new(vec![0u8; buf_size]);
@@ -190,26 +212,47 @@ impl SecureMemoryVault {
 
     /// Returns `true` if the region holding key, nonce, and ciphertext is currently mlock'd.
     pub fn is_locked(&self) -> bool {
-        self.is_locked.load(Ordering::SeqCst)
+        self.region.is_some()
     }
 }
 
-impl Drop for SecureMemoryVault {
-    fn drop(&mut self) {
-        let was_locked = self.is_locked.swap(false, Ordering::SeqCst);
-        let ptr = self.region.as_mut_ptr();
-        let len = self.locked_len;
+/// Generates the stream key and nonce directly inside the locked region and
+/// seals `plaintext` after them, chunk by chunk.
+fn seal_into(
+    region: &mut [u8],
+    chunk_size: usize,
+    plaintext: &[u8],
+) -> Result<(), MemoryVaultError> {
+    let (prefix, ciphertext) = region.split_at_mut(CIPHERTEXT_OFFSET);
+    let (key_bytes, nonce_bytes) = prefix.split_at_mut(NONCE_OFFSET);
+    secure_bytes_fill(key_bytes)?;
+    secure_bytes_fill(nonce_bytes)?;
 
-        // Wipe while the pages are still locked. Vec::zeroize clears the
-        // whole capacity in place without reallocating, so `ptr` remains
-        // valid for the munlock below.
-        self.region.zeroize();
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // orion copies the key into its own (zeroize-on-drop) types for the
+    // duration of the operation; the long-lived copy stays in the region.
+    let key = SecretKey::from_slice(key_bytes).map_err(|_| MemoryVaultError::Crypto)?;
+    let nonce = Nonce::from_slice(nonce_bytes).map_err(|_| MemoryVaultError::Crypto)?;
+    let mut encr = StreamXChaCha20Poly1305::new(&key, &nonce);
 
-        if was_locked && len > 0 {
-            unsafe { munlock(ptr, len) };
-        }
+    let num_chunks = plaintext.len().div_ceil(chunk_size);
+    let mut ct_offset = 0;
+    for (i, chunk) in plaintext.chunks(chunk_size).enumerate() {
+        let tag = if i + 1 == num_chunks {
+            StreamTag::Finish
+        } else {
+            StreamTag::Message
+        };
+        let out_len = chunk.len() + ABYTES;
+        encr.seal_chunk(
+            chunk,
+            None,
+            &mut ciphertext[ct_offset..ct_offset + out_len],
+            &tag,
+        )
+        .map_err(|_| MemoryVaultError::Crypto)?;
+        ct_offset += out_len;
     }
+    Ok(())
 }
 
 impl Debug for SecureMemoryVault {
@@ -232,7 +275,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_send_and_sync_hold_without_unsafe_impls() {
+    fn test_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SecureMemoryVault>();
     }
@@ -241,19 +284,58 @@ mod tests {
     fn test_region_holds_key_nonce_and_ciphertext_and_is_locked() {
         let data = b"abcd";
         let vault = SecureMemoryVault::new(data).unwrap();
-        assert_eq!(vault.region.len(), CIPHERTEXT_OFFSET + data.len() + ABYTES);
-        assert_eq!(vault.locked_len, vault.region.len());
+        let region = vault.region.as_ref().unwrap().as_slice();
+        assert_eq!(region.len(), CIPHERTEXT_OFFSET + data.len() + ABYTES);
         assert!(vault.is_locked());
         // The key and nonce were generated in place: not all zeros.
-        assert!(vault.region[..CIPHERTEXT_OFFSET].iter().any(|&b| b != 0));
+        assert!(region[..CIPHERTEXT_OFFSET].iter().any(|&b| b != 0));
     }
 
     #[test]
     fn test_empty_plaintext_has_no_region_and_is_not_locked() {
         let vault = SecureMemoryVault::new(b"").unwrap();
-        assert!(vault.region.is_empty());
-        assert_eq!(vault.locked_len, 0);
+        assert!(vault.region.is_none());
         assert!(!vault.is_locked());
+    }
+
+    #[test]
+    fn test_containers_do_not_share_pages() {
+        // munlock is not reference counted: if two regions shared a page,
+        // dropping one would unlock the other. Every region must therefore
+        // sit in pages of its own. 4096 is the smallest page size memseal
+        // runs on; distinct 4 KiB pages imply distinct larger pages too.
+        let a = SecureMemoryVault::new(&[1u8; 32]).unwrap();
+        let b = SecureMemoryVault::new(&[2u8; 32]).unwrap();
+        let pa = a.region.as_ref().unwrap().as_slice().as_ptr() as usize;
+        let pb = b.region.as_ref().unwrap().as_slice().as_ptr() as usize;
+        assert_ne!(pa / 4096, pb / 4096, "regions share a page");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_dropping_one_container_keeps_the_other_locked() {
+        fn locked_kb() -> u64 {
+            let smaps = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+            smaps
+                .lines()
+                .find_map(|line| line.strip_prefix("Locked:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|kb| kb.parse().ok())
+                .expect("Locked: line in smaps_rollup")
+        }
+
+        let a = SecureMemoryVault::new(&[1u8; 32]).unwrap();
+        let b = SecureMemoryVault::new(&[2u8; 32]).unwrap();
+        assert!(locked_kb() >= 4);
+        drop(a);
+        // `b` still holds at least one locked page. Other tests may add
+        // locked pages concurrently, so this is a lower bound.
+        assert!(
+            locked_kb() >= 4,
+            "dropping one container unlocked the other"
+        );
+        assert!(b.is_locked());
+        drop(b);
     }
 
     #[test]
@@ -312,7 +394,7 @@ mod tests {
         let data = b"test";
         let mut vault = SecureMemoryVault::new(data).unwrap();
         // Corrupt the first ciphertext byte after the key and nonce.
-        vault.region[CIPHERTEXT_OFFSET] ^= 0xFF;
+        vault.region.as_mut().unwrap().as_mut_slice()[CIPHERTEXT_OFFSET] ^= 0xFF;
         let err = vault.access(|_, _| Ok(()));
         assert!(matches!(err, Err(MemoryVaultError::Crypto)));
     }
