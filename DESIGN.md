@@ -4,10 +4,12 @@ This document describes the on-disk vault format, the key derivation chain,
 nonce handling, the AAD bindings that protect against tampering, and the
 bounded-parsing rules enforced when opening a vault.
 
-It targets format version `VAULT_VERSION = 1` and index version
-`VAULT_INDEX_VERSION = 1` (see `src/constants.rs`). Anything called out as
+It targets format version `VAULT_VERSION = 2` and index version
+`VAULT_INDEX_VERSION = 2` (see `src/constants.rs`). Anything called out as
 "current" here is fixed for this version; format changes are reserved for
-future major or minor bumps as described under `Versioning` below.
+future major or minor bumps as described under `Versioning` below. Files
+written in format version 1 (releases up to 0.2.1) are still read; section
+12 describes that format and how it is migrated.
 
 
 ## 1. Scope and non-goals
@@ -41,12 +43,12 @@ offset  length        field                          notes
 0       4             header_len (u32 little-endian) length of the header JSON
 4       header_len    header_json                    UTF-8 JSON, see section 3
 H       24            index_nonce                    XChaCha20 nonce (random per export)
-H+24    8             nonce_counter (u64 LE)         see section 9 (oddity)
-H+32    *             encrypted_index                XChaCha20-Poly1305 with AAD
+H+24    *             encrypted_index                XChaCha20-Poly1305 with AAD
 ```
 
 Where `H = 4 + header_len`. The trailing `encrypted_index` is the
-ciphertext with a 16-byte Poly1305 tag appended.
+ciphertext with a 16-byte Poly1305 tag appended; its plaintext is the
+binary index of section 7.
 
 Total file size is bounded by `MAX_VAULT_FILE_SIZE = 256 MiB`, enforced on
 both sides: `Vault::load` refuses to read a larger file, and
@@ -63,22 +65,26 @@ In order, `Vault::open(password, data)` enforces:
 1. `data.len() >= 4` (room for `header_len`).
 2. `header_len <= MAX_HEADER_JSON_LEN` (4 KiB). This also rules out any
    offset overflow in the steps below.
-3. `data.len() >= 4 + header_len + 24 + 8` (room for nonce and counter).
+3. `data.len() >= 4 + header_len + 24` (room for header and nonce).
 4. `header_json` parses as valid `VaultHeader` JSON.
 5. `validate_header(&header)` succeeds (see section 3). This is the last
    check before Argon2i runs with the parameters taken from the header.
+   If `header.version` is 1, the 8 legacy counter bytes that follow the
+   nonce must also be present and are skipped (section 12).
 6. Argon2i and HKDF derive the subkeys, then XChaCha20-Poly1305
    verification of `encrypted_index` succeeds with the serialized header
    JSON as AAD.
-7. The decrypted index JSON parses, its `version` is in
-   `SUPPORTED_VAULT_INDEX_VERSIONS`, its `files` map holds at most
-   `MAX_INDEX_ENTRIES` entries, and no entry carries an `encrypted_data`
-   or `encrypted_name` blob larger than `store()` can produce (section 8).
+7. The decrypted index decodes under the rules of section 7 (version tag,
+   entry count, every length against the remaining bytes and the
+   documented bounds, no duplicate keys, no trailing bytes). A version 1
+   header selects the legacy JSON decoder of section 12 instead.
 8. `data_nonce_counter` is strictly greater than every stored
    `data_counter` (section 7).
 
-Failures at steps 1-5 return `VaultError::CorruptedData(...)`. Failure at
-step 6 returns `VaultError::InvalidPassword`: the AEAD does not
+Steps 1-5 are implemented by `parse_envelope`, a pure function with no
+key derivation, and step 7 by `decode_index`; both are the intended fuzz
+targets. Failures at steps 1-5 return `VaultError::CorruptedData(...)`.
+Failure at step 6 returns `VaultError::InvalidPassword`: the AEAD does not
 distinguish "wrong key" from "tampered ciphertext or AAD" by design, so
 the variant means "authentication failed", not "the password was
 mistyped". Failures at steps 7 and 8 return
@@ -221,58 +227,60 @@ the plaintext name), and the AEAD will reject.
 
 ## 7. Encrypted index
 
-After AEAD verification, the index decrypts to a JSON document with the
-shape:
+After AEAD verification, the index decrypts to a binary document. All
+integers are little-endian:
 
-```json
-{
-  "version": 1,
-  "nonce": [24 bytes],
-  "nonce_counter": 7,
-  "data_nonce_counter": 42,
-  "files": {
-    "<hmac_key_hex of plaintext name>": {
-      "location": "Inline" | { "SmallFileInPack": { ... } } | { "LargeFile": { ... } },
-      "created": 0,
-      "modified": 0,
-      "is_dummy": false,
-      "encrypted_data": [bytes] | null,
-      "encrypted_name": [bytes] | null,
-      "data_counter": 17
-    },
-    ...
-  }
-}
+```
+u16     version            must equal VAULT_INDEX_VERSION (currently 2)
+u64     nonce_counter      section 5.1
+u64     data_nonce_counter section 5.1
+u32     entry_count        <= MAX_INDEX_ENTRIES
+entry_count times:
+  [32]  hmac_key           HMAC-SHA256(hmac_key, plaintext_name), raw
+  u64   data_counter       bound into the entry AAD (section 6)
+  u32   name_ct_len        in [40, 24 + MAX_ENTRY_NAME_LEN + 16]
+  [..]  name_ct            data of section 8, nonce prefix included
+  u32   data_ct_len        in [40, 24 + MAX_ENTRY_DATA_SIZE + 16]
+  [..]  data_ct            data of section 8, nonce prefix included
 ```
 
-The map keys are HMAC-SHA256 of plaintext entry names, hex-encoded. This
-prevents leaking entry names through the serialized vault. Entry name
-lookup at runtime always re-derives the HMAC of the plaintext name with
-the in-memory `hmac_key` before consulting the map.
+Nothing follows the last entry. Overhead is 22 bytes for the preamble and
+48 bytes per entry, so the file size is the sum of the ciphertexts plus
+a few hundred bytes; in format version 1 the same data cost about 3.6
+bytes per ciphertext byte (section 12).
 
-`MAX_INDEX_ENTRIES = 1024` is enforced on `insert_file` and again on
-`open()`: after the index JSON is decrypted and parsed, an index whose
-`files` map holds more than `MAX_INDEX_ENTRIES` entries is rejected with
-`VaultError::CorruptedData` before the in-memory `VaultIndex` is built.
-The file-size and ciphertext-size bounds upstream already make it
-impractical to embed many more than this in a single 256 MiB file; the
-explicit cap on `open()` closes the gap so a crafted index cannot force a
-larger map than the format allows.
+The entry keys are HMAC-SHA256 of plaintext entry names. This prevents
+leaking entry names through the serialized vault. Entry name lookup at
+runtime always re-derives the HMAC of the plaintext name with the
+in-memory `hmac_key` before consulting the map. In memory and in the
+entry AAD the key is used in its lower-case hex form (section 6); the
+raw 32 bytes are only a storage encoding of the same value.
 
-`open()` also checks every entry's ciphertext sizes against what `store()`
-can produce: `encrypted_data` is at most `24 + MAX_ENTRY_DATA_SIZE + 16`
-bytes and `encrypted_name` at most `24 + MAX_ENTRY_NAME_LEN + 16` bytes
-(nonce prefix, plaintext bound, Poly1305 tag). The 256 MiB file bound
-already makes larger blobs impractical; the explicit check keeps
-`retrieve()` and `change_password()` from allocating for a blob outside
-the documented limits and fails on `open()` with `CorruptedData` instead.
+The decoder (`decode_index`) checks every field before acting on it:
+
+* the version tag must match;
+* `entry_count` must not exceed `MAX_INDEX_ENTRIES = 1024`, and
+  `entry_count` times the smallest possible entry (128 bytes) must fit in
+  the bytes that remain, before the map is allocated;
+* each length prefix must lie within the bounds above (the lower bound is
+  a nonce plus a tag around an empty plaintext, the upper bound what
+  `store()` can produce) and within the remaining input, before the
+  corresponding bytes are copied;
+* a duplicate key or trailing bytes after the last entry reject the index.
+
+The same `MAX_INDEX_ENTRIES` cap applies to `insert_by_key` at runtime,
+where exceeding it is `VaultError::InvalidInput`; on `open()` it is
+`VaultError::CorruptedData`. The 256 MiB file bound already makes larger
+indexes impractical; the explicit checks keep `retrieve()` and
+`change_password()` from ever allocating for a blob outside the documented
+limits.
 
 
 ## 8. Per-entry encryption
 
-For each stored secret, the in-memory metadata holds two ciphertext
-blobs (`encrypted_data` and `encrypted_name`), each prefixed with its
-24-byte nonce:
+For each stored secret, the index holds two ciphertext blobs
+(`encrypted_data` and `encrypted_name`), each prefixed with its 24-byte
+nonce:
 
 ```
 encrypted_data = data_nonce (24B) || XChaCha20-Poly1305(enc_key, data_nonce, plaintext_data, aad=entry_aad)
@@ -283,37 +291,24 @@ entry_aad      = hmac_key_hex(plaintext_name) bytes || data_counter as u64 LE
 `data_nonce` and `name_nonce` are independent random values generated by
 `store()` (section 5). The `data_counter` no longer drives nonce
 derivation; it remains in the AAD so that ciphertexts cannot be replayed
-across counter generations of the same entry name.
+across counter generations of the same entry name. The AAD uses the hex
+form of the key, as format version 1 did, so entry ciphertexts are
+carried over byte for byte when a legacy vault is migrated (section 12).
 
 Limits:
 
 * `MAX_ENTRY_NAME_LEN = 255` bytes.
 * `MAX_ENTRY_DATA_SIZE = 64 MiB`.
 
-Note that the aggregate bound across all entries is tighter than these
-per-entry limits suggest, because of the JSON encoding of ciphertext
-bytes (see section 9.3): total stored plaintext beyond roughly 70 MiB
-makes the export exceed `MAX_VAULT_FILE_SIZE` and fail.
+The aggregate bound is the file bound: total stored ciphertext plus about
+50 bytes per entry must stay under `MAX_VAULT_FILE_SIZE`, so a vault holds
+a little under 256 MiB of secrets in total, and `Vault::export` fails
+cleanly rather than producing a file that `Vault::load` would refuse.
 
 
 ## 9. Known oddities (current format)
 
-These behaviors are pinned by tests and documented here so future format
-revisions can address them deliberately.
-
-### 9.1 Unused exported `nonce_counter` field
-
-`Vault::export()` writes `index.nonce_counter` as 8 bytes (LE u64) at
-offset `4 + header_len + 24`. `Vault::open()` skips those 8 bytes; the
-authoritative `nonce_counter` is recovered from the encrypted index JSON
-(see section 7). The on-disk field is therefore wire-format dead weight.
-It does not affect security (the encrypted-index counter is authenticated
-via AAD), but the format would be tidier without it.
-
-Cleanup is scheduled for `0.2.x` because removing the field is a vault
-format break (`VAULT_VERSION` bump). See `ROADMAP.md`.
-
-### 9.2 Header JSON canonicalization
+### 9.1 Header JSON canonicalization
 
 As noted in section 3, the AAD used for index encryption is the bytes
 returned by `serde_json::to_vec(&header)` at encryption time, and at
@@ -321,21 +316,6 @@ open() the same call is made on the deserialized header. Both
 serializations are produced by the same code path so they agree, but a
 hand-edited header file with semantically-equal but textually-different
 JSON would not round-trip.
-
-### 9.3 JSON number-array encoding of ciphertext bytes
-
-`encrypted_data` and `encrypted_name` are serialized into the index JSON
-as arrays of integers (`[31, 254, ...]`), which costs roughly 3.6 output
-bytes per ciphertext byte for uniformly distributed values. The practical
-consequence is that the aggregate plaintext a vault can hold is about
-70 MiB before the export crosses `MAX_VAULT_FILE_SIZE`, far below what
-`MAX_ENTRY_DATA_SIZE * MAX_INDEX_ENTRIES` would suggest. `Vault::export`
-enforces the bound and fails cleanly rather than producing a file that
-`Vault::load` would refuse.
-
-A denser encoding (base64 or a binary index format) is scheduled for
-`0.2.x` together with the other format cleanup, since changing the index
-JSON structure is a `VAULT_INDEX_VERSION` break. See `ROADMAP.md`.
 
 
 ## 10. Bounded parsing summary
@@ -351,12 +331,13 @@ All inputs that affect parsing memory or CPU are bounded before use:
 | `header.kdf_memory_cost`  | `[32 MiB, 256 MiB]`          | `validate_header`            |
 | `header.kdf_iterations`   | `[3, 10]`                    | `validate_header`            |
 | `header.key_length`       | `== KEY_LEN (32)`            | `validate_header`            |
-| index `version`           | in `SUPPORTED_VAULT_INDEX_VERSIONS` | `Vault::open` step 7  |
+| index `version`           | `== VAULT_INDEX_VERSION` (or 1 under a v1 header) | `decode_index` |
 | entry name length         | `<= MAX_ENTRY_NAME_LEN (255)`| `Vault::store`               |
 | entry data size           | `<= MAX_ENTRY_DATA_SIZE (64 MiB)` | `Vault::store`          |
-| `encrypted_data` length   | `<= 24 + 64 MiB + 16`        | `Vault::open` step 7         |
-| `encrypted_name` length   | `<= 24 + 255 + 16`           | `Vault::open` step 7         |
-| index entry count         | `<= MAX_INDEX_ENTRIES (1024)`| `VaultIndex::insert_file`, `Vault::open` |
+| `encrypted_data` length   | `40 <= len <= 24 + 64 MiB + 16` | `decode_index`, before copying |
+| `encrypted_name` length   | `40 <= len <= 24 + 255 + 16`  | `decode_index`, before copying |
+| index entry count         | `<= MAX_INDEX_ENTRIES (1024)`, and plausible for the bytes left | `VaultIndex::insert_by_key`, `decode_index` |
+| index trailing bytes      | none                         | `decode_index`               |
 | password length           | `>= MIN_PASSWORD_LEN (8)`    | `Vault::create`              |
 
 ### 10.1 Pre-authentication cost and KDF policy
@@ -370,7 +351,8 @@ rejected:
 * at most 4 KiB of header JSON is parsed;
 * at most one Argon2i derivation with a 256 MiB working set and 10
   passes, which is also the size of the largest file `load()` reads;
-* HKDF and one AEAD verification over at most 256 MiB of ciphertext.
+* HKDF and one AEAD verification over at most 256 MiB of ciphertext,
+  then one linear pass over the decrypted index.
 
 The lower bounds serve the opposite goal: any file this library agrees to
 open costs an attacker at least 32 MiB and 3 passes per password guess,
@@ -391,16 +373,17 @@ repeats the derivation.
 
 ## 11. Versioning
 
-`VAULT_VERSION` (header) and `VAULT_INDEX_VERSION` (index JSON) are
-independent. Either bumping signals a format break. Today both are `1`.
+`VAULT_VERSION` (header) and `VAULT_INDEX_VERSION` (index) are
+independent. Either bumping signals a format break. Today both are `2`;
+version 1 of both is read through the legacy path of section 12.
 
 Changes that require a version bump:
 
 * Adding, removing, renaming, or reordering header fields.
 * Changing any HKDF `info` prefix string.
 * Changing the KDF algorithm or its default parameters.
-* Changing the layout of section 2 (nonce position, counter field, etc.).
-* Changing the structure of the index JSON.
+* Changing the layout of section 2 (nonce position, etc.).
+* Changing the structure of the binary index.
 
 Changes that do NOT require a version bump:
 
@@ -437,8 +420,8 @@ binary is upgraded in place.
 
 Use when:
 
-* The break is small (e.g., removing the dead-weight `nonce_counter`
-  field from section 9.1, or adding a new optional header field).
+* The break is small (e.g., the 1 to 2 transition of section 12, or
+  adding a new optional header field).
 * The legacy reader can be implemented in a few dozen lines without
   re-deriving crypto primitives.
 
@@ -501,7 +484,7 @@ For the foreseeable `0.x` releases:
 | Change                                              | Default option |
 | --------------------------------------------------- | -------------- |
 | Add/remove a header field                           | A              |
-| Remove the dead-weight `nonce_counter` field (9.1)  | A              |
+| Format 1 to format 2 (section 12)                   | A (shipped)    |
 | Add a new optional index field with a default       | not a break    |
 | Change a HKDF `info` prefix                         | B              |
 | Swap KDF algorithm                                  | B              |
@@ -511,3 +494,58 @@ For the foreseeable `0.x` releases:
 Document the decision in `CHANGELOG.md` under the release that ships
 the break, and in the migration function's doc comment if option B is
 used.
+
+
+## 12. Legacy format version 1
+
+Releases up to 0.2.1 wrote `VAULT_VERSION = 1`. The current build reads
+those files (option A of section 11.1) and the next `export()` or
+`save()` rewrites them in format version 2; `open()` sets the in-memory
+header version to 2 as soon as the file has been authenticated, so the
+rewrite needs no separate migration step. The legacy reader is kept and
+tested (a fixture written by 0.2.1 lives in `tests/fixtures/`) for at
+least one further release cycle.
+
+Differences from the current format:
+
+* The envelope carries 8 extra bytes after the index nonce: a copy of
+  `nonce_counter` that was never read back. `parse_envelope` requires and
+  skips them when `header.version == 1`.
+* The index is a JSON document:
+
+  ```json
+  {
+    "version": 1,
+    "nonce": [24 bytes],
+    "nonce_counter": 7,
+    "data_nonce_counter": 42,
+    "files": {
+      "<hmac_key_hex>": {
+        "location": "Inline",
+        "created": 0,
+        "modified": 0,
+        "is_dummy": false,
+        "encrypted_data": [bytes] | null,
+        "encrypted_name": [bytes] | null,
+        "data_counter": 17
+      }
+    }
+  }
+  ```
+
+  Ciphertext bytes are number arrays, which cost about 3.6 output bytes
+  per stored byte and capped the practical aggregate plaintext at about
+  70 MiB. `nonce` duplicates the envelope nonce and is ignored;
+  `location`, `created`, and `modified` are accepted and ignored; entries
+  flagged `is_dummy` carry no payload and are dropped. A real entry must
+  hold both ciphertexts within the bounds of section 7 and a 64-character
+  hex key, otherwise the (authenticated) index is inconsistent and the
+  vault is rejected with `CorruptedData` rather than silently losing an
+  entry.
+
+Everything else (header, KDF chain, AAD bindings, per-entry encryption)
+is identical, which is why migration is a pure re-encoding: entry
+ciphertexts are carried over unchanged and no plaintext is touched. A
+version 2 file whose header is rewritten to claim version 1 fails the
+AEAD, since the header is the AAD, so the legacy path cannot be forced
+on a current file.

@@ -116,11 +116,14 @@ fn main() -> Result<(), VaultError> {
 | KDF parameters accepted by `open()` | 32 MiB to 256 MiB memory, 3 to 10 iterations |
 
 The 256 MiB file bound is enforced on both sides: `load()` refuses larger
-files and `export()`/`save()` refuse to produce them. Encrypted entry
-bytes are stored in the index JSON as number arrays (roughly 3.6 output
-bytes per stored byte), so the practical bound on total stored plaintext
-across all entries is about 70 MiB; `export()` fails cleanly when it is
-exceeded and the vault stays usable. See `DESIGN.md` section 9.3.
+files and `export()`/`save()` refuse to produce them. The index is a
+compact binary encoding (about 50 bytes of overhead per entry), so the
+bound on total stored secrets is a little under 256 MiB; `export()` fails
+cleanly when it is exceeded and the vault stays usable.
+
+Vault files written by releases up to 0.2.1 (format version 1, JSON index)
+are still opened transparently and rewritten in the current format on the
+next `export()` or `save()`. See `DESIGN.md` section 12.
 
 ### Errors
 
@@ -272,14 +275,14 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 
 | Threat | Mitigation |
 |--------|------------|
-| **Tampered vault data** | The vault header is authenticated as AAD for index decryption; the index JSON and every per-entry payload are encrypted and authenticated with XChaCha20-Poly1305. Bit flips in authenticated header fields, nonces, ciphertext, or Poly1305 tags are detected during `open()` or entry retrieval. |
+| **Tampered vault data** | The vault header is authenticated as AAD for index decryption; the index and every per-entry payload are encrypted and authenticated with XChaCha20-Poly1305. Bit flips in authenticated header fields, nonces, ciphertext, or Poly1305 tags are detected during `open()` or entry retrieval. |
 | **Entry swap attacks** | Each entry's data and name ciphertexts share an AAD made of the entry's HMAC-derived key and its `data_counter`. Swapping either the encrypted data or the encrypted name across entries causes AEAD verification to fail. |
 | **Entry name leakage in serialized vaults** | Entry names are not stored in plaintext. Index keys are derived with HMAC-SHA256. |
 | **KDF parameter downgrade** | The vault header is authenticated as AAD, so tampering with persisted KDF parameters is detected. Header KDF fields are also bounded before they reach Argon2i: `open()` accepts only 32 MiB to 256 MiB of memory and 3 to 10 iterations, so a forged header can neither make password guessing cheap nor force more than one 256 MiB, 10-pass derivation before the file is rejected. See `DESIGN.md` section 10.1. |
 | **Nonce reuse** | All XChaCha20 nonces are 24-byte values drawn from the OS CSPRNG and stored next to the ciphertext they protect: a fresh index nonce on every `export()`, fresh entry data/name nonces on every `store()`. Random generation also covers state forks: two vault instances opened from the same persisted bytes cannot repeat a nonce when both export, which counter-derived nonces would. Monotonic counters remain as authenticated state, are bound into entry AAD, and overflow at `u64::MAX` is a hard error. |
 | **Key reuse across roles** | The Argon2i-derived master key is never used directly. HKDF-SHA256 derives two 32-byte subkeys with disjoint `info` strings: one for XChaCha20-Poly1305, one for HMAC-SHA256 entry-name hashing. The master key is zeroized as soon as both subkeys exist. |
 | **Plaintext lifetime inside the library** | Internal temporary plaintext and key material are zeroized where possible, including error paths. |
-| **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. `open()` rejects an index whose entry count exceeds the 1024 cap or whose entries are larger than `store()` can produce. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
+| **Resource exhaustion from crafted files** | Vault file size (256 MiB), header JSON length (4 KiB), KDF parameters, entry name length, entry data size, per-entry ciphertext sizes, and the decoded index entry count are bounded before processing. The binary index decoder checks every length against the remaining input and the documented bounds before copying, and rejects duplicate keys and trailing bytes. The residual, deliberate cost of opening a hostile file is one bounded Argon2i derivation. |
 | **Swap and core-dump exposure of in-memory subkeys** | Each subkey lives in a `LockedSecret`: a `memsec` allocation that occupies pages of its own, sits between guard pages, is locked with `mlock` where supported (on Linux also excluded from core dumps), and is zeroized on drop. |
 
 ### Out of scope / limitations

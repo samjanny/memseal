@@ -1,5 +1,9 @@
-pub const VAULT_VERSION: u16 = 1;
-pub const SUPPORTED_VAULT_VERSIONS: [u16; 1] = [VAULT_VERSION];
+/// Current on-disk format version, written into every header by `export`.
+pub const VAULT_VERSION: u16 = 2;
+/// The format version written by releases up to 0.2.1. Read-only: `open`
+/// accepts it and the next `export` rewrites the vault as `VAULT_VERSION`.
+pub const LEGACY_VAULT_VERSION_1: u16 = 1;
+pub const SUPPORTED_VAULT_VERSIONS: [u16; 2] = [LEGACY_VAULT_VERSION_1, VAULT_VERSION];
 
 /// Argon2i parameters for password hashing.
 /// Note: orion only supports Argon2i (not Argon2id) with p=1.
@@ -11,8 +15,10 @@ pub mod argon2 {
 }
 
 pub mod vault_index_constants {
-    pub const VAULT_INDEX_VERSION: u16 = 1;
-    pub const SUPPORTED_VAULT_INDEX_VERSIONS: [u16; 1] = [VAULT_INDEX_VERSION];
+    /// Version tag at the start of the binary index (DESIGN.md section 7).
+    pub const VAULT_INDEX_VERSION: u16 = 2;
+    /// Version field of the JSON index written by format version 1.
+    pub const LEGACY_INDEX_VERSION_1: u16 = 1;
     pub const MAX_INDEX_ENTRIES: usize = 1024;
 }
 

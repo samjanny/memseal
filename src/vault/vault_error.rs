@@ -43,9 +43,7 @@ pub enum VaultError {
 impl From<IndexError> for VaultError {
     fn from(error: IndexError) -> Self {
         match error {
-            IndexError::UnsupportedVersion | IndexError::Inconsistent(_) => {
-                VaultError::CorruptedData(error.to_string())
-            }
+            IndexError::Inconsistent(_) => VaultError::CorruptedData(error.to_string()),
             IndexError::Full(_) => VaultError::InvalidInput(error.to_string()),
             IndexError::CounterOverflow(_)
             | IndexError::Random(_)

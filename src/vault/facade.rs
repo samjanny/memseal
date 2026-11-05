@@ -24,30 +24,21 @@
 use crate::constants::argon2::KEY_LEN;
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::constants::{
-    MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MAX_HEADER_JSON_LEN, MAX_KDF_ITERATIONS,
-    MAX_KDF_MEMORY, MAX_VAULT_FILE_SIZE, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, MIN_PASSWORD_LEN,
-    SUPPORTED_VAULT_VERSIONS, VAULT_VERSION,
+    LEGACY_VAULT_VERSION_1, MAX_ENTRY_DATA_SIZE, MAX_ENTRY_NAME_LEN, MAX_HEADER_JSON_LEN,
+    MAX_KDF_ITERATIONS, MAX_KDF_MEMORY, MAX_VAULT_FILE_SIZE, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY,
+    MIN_PASSWORD_LEN, SUPPORTED_VAULT_VERSIONS, VAULT_VERSION,
 };
 use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
 use crate::crypto::utils::secure_bytes_fill;
 use crate::mem::locked_secret::LockedSecret;
+use crate::vault::index_codec::{decode_index, decode_index_v1, encode_index};
 use crate::vault::vault_error::VaultError;
 use crate::vault::vault_header::VaultHeader;
-use crate::vault::vault_index::{
-    IndexMetaBlockLocation, IndexMetaBlockMetadata, VaultIndex, derive_subkeys,
-};
+use crate::vault::vault_index::{IndexEntry, VaultIndex, derive_subkeys};
 use orion::hazardous::kdf::argon2i;
-use orion::hazardous::mac::poly1305::POLY1305_OUTSIZE;
-use std::collections::HashMap;
 use std::io::Read as IoRead;
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
-
-/// Largest `encrypted_data` blob `store` can produce: nonce prefix, the
-/// largest accepted plaintext, and the Poly1305 tag.
-const MAX_ENCRYPTED_DATA_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_DATA_SIZE + POLY1305_OUTSIZE;
-/// Largest `encrypted_name` blob `store` can produce.
-const MAX_ENCRYPTED_NAME_LEN: usize = XCHACHA20_NONCE_LEN + MAX_ENTRY_NAME_LEN + POLY1305_OUTSIZE;
 
 /// An encrypted in-memory vault for storing named secrets.
 ///
@@ -96,6 +87,11 @@ impl Vault {
     /// a forged file can cost is one Argon2i derivation at 256 MiB and 10
     /// passes; see `DESIGN.md` section 10.
     ///
+    /// Both the current format (version 2) and the format written by
+    /// releases up to 0.2.1 (version 1) are accepted. A version 1 vault is
+    /// upgraded in memory; the next [`Vault::export`] or [`Vault::save`]
+    /// writes it in the current format.
+    ///
     /// # Errors
     ///
     /// Returns [`VaultError::InvalidPassword`] when the encrypted index fails
@@ -107,7 +103,7 @@ impl Vault {
     /// index) return [`VaultError::CorruptedData`].
     pub fn open(password: &[u8], data: &[u8]) -> Result<Self, VaultError> {
         let envelope = parse_envelope(data)?;
-        let header = envelope.header;
+        let mut header = envelope.header;
 
         // Argon2 is the expensive step; everything above is cheap. The two
         // subkeys are derived exactly once and the master key is dropped
@@ -122,21 +118,29 @@ impl Vault {
         let aad = header.to_aad_bytes()?;
         // The decrypted index (HMAC entry names, nonce counters, structural
         // metadata) is cleared on scope exit as well.
-        let index_json = Zeroizing::new(
+        let index_bytes = Zeroizing::new(
             open_with_aad(&enc_sub, &envelope.nonce, envelope.encrypted_index, &aad)
                 .map_err(|_| VaultError::InvalidPassword)?,
         );
 
-        let idx_data = decode_index(&index_json)?;
+        let idx_data = if header.version == LEGACY_VAULT_VERSION_1 {
+            decode_index_v1(&index_bytes)?
+        } else {
+            decode_index(&index_bytes)?
+        };
 
         let index = VaultIndex::from_subkeys_and_data(
             &enc_sub,
             &hmac_sub,
-            idx_data.nonce,
+            envelope.nonce,
             idx_data.nonce_counter,
             idx_data.data_nonce_counter,
             idx_data.files,
         )?;
+
+        // The in-memory vault is always current-format: a legacy file is
+        // rewritten as version 2 by the next export (DESIGN.md 11.1, option A).
+        header.version = VAULT_VERSION;
 
         Ok(Vault { header, index })
     }
@@ -207,25 +211,21 @@ impl Vault {
             seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)?;
         drop(enc_key_bytes);
 
-        let mut encrypted = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
-        encrypted.extend_from_slice(&data_nonce);
-        encrypted.extend_from_slice(&ciphertext);
+        let mut encrypted_data = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
+        encrypted_data.extend_from_slice(&data_nonce);
+        encrypted_data.extend_from_slice(&ciphertext);
 
-        let mut enc_name = Vec::with_capacity(XCHACHA20_NONCE_LEN + encrypted_name_ct.len());
-        enc_name.extend_from_slice(&name_nonce);
-        enc_name.extend_from_slice(&encrypted_name_ct);
+        let mut encrypted_name = Vec::with_capacity(XCHACHA20_NONCE_LEN + encrypted_name_ct.len());
+        encrypted_name.extend_from_slice(&name_nonce);
+        encrypted_name.extend_from_slice(&encrypted_name_ct);
 
-        let metadata = IndexMetaBlockMetadata::new(
-            IndexMetaBlockLocation::Inline,
-            0,
-            0,
-            false,
-            Some(encrypted),
-            Some(enc_name),
+        let entry = IndexEntry {
             data_counter,
-        );
+            encrypted_name,
+            encrypted_data,
+        };
 
-        self.index.insert_by_key(hmac_key, metadata)?;
+        self.index.insert_by_key(hmac_key, entry)?;
         Ok(())
     }
 
@@ -295,27 +295,13 @@ impl Vault {
 
     fn decrypt_secret(&self, name: &str) -> Result<Option<Vec<u8>>, VaultError> {
         let hmac_key = self.index.hmac_key_for_name(name)?;
-        let Some(meta) = self.index.lookup_by_key(&hmac_key) else {
+        let Some(entry) = self.index.lookup_by_key(&hmac_key) else {
             return Ok(None);
         };
 
-        let encrypted = match &meta.encrypted_data {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        if encrypted.len() < XCHACHA20_NONCE_LEN {
-            return Err(VaultError::CorruptedData(
-                "Encrypted data too short for nonce".to_string(),
-            ));
-        }
-
+        let (nonce, ciphertext) = split_nonce(&entry.encrypted_data)?;
+        let entry_aad = build_entry_aad(&hmac_key, entry.data_counter);
         let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
-
-        let nonce: [u8; XCHACHA20_NONCE_LEN] = encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
-        let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
-
-        let entry_aad = build_entry_aad(&hmac_key, meta.data_counter);
 
         let plaintext = open_with_aad(&enc_key_bytes, &nonce, ciphertext, &entry_aad)?;
         Ok(Some(plaintext))
@@ -329,50 +315,44 @@ impl Vault {
         Ok(self.index.remove_by_key(&hmac_key).is_some())
     }
 
-    /// Serializes the vault to bytes for persistence.
+    /// Serializes the vault to bytes for persistence, always in the current
+    /// format (version 2).
     ///
     /// Each call generates a fresh random index nonce and advances the
     /// authenticated nonce counter.
     ///
     /// Returns [`VaultError::SerializationError`] if the serialized vault
     /// exceeds the 256 MiB file-size bound enforced by [`Vault::load`]; this
-    /// guarantees that anything `export()` produces can be loaded back.
-    /// Encrypted entry bytes are stored in the index JSON as number arrays
-    /// (roughly 3.6 output bytes per stored byte), so the practical bound on
-    /// total stored plaintext is about 70 MiB. The vault itself is left
-    /// intact by this error; remove entries and export again.
+    /// guarantees that anything `export()` produces can be loaded back. The
+    /// index is a compact binary encoding, so the bound on total stored
+    /// ciphertext is close to the file bound itself (about 56 bytes of
+    /// overhead per entry plus the header). The vault itself is left intact
+    /// by this error; remove entries and export again.
     pub fn export(&mut self) -> Result<Vec<u8>, VaultError> {
         self.index.advance_nonce()?;
 
-        // Wrap in Zeroizing so the serialized header and index buffers are
-        // cleared on scope exit. header_json carries only public KDF params,
-        // but index_json carries structural metadata; clear both for
-        // consistency with the rest of the key-handling in this file.
-        let header_json = zeroize::Zeroizing::new(
+        let header_json = Zeroizing::new(
             serde_json::to_vec(&self.header)
                 .map_err(|e| VaultError::SerializationError(e.to_string()))?,
         );
 
-        let index_json = zeroize::Zeroizing::new(
-            serde_json::to_vec(&self.index)
-                .map_err(|e| VaultError::SerializationError(e.to_string()))?,
-        );
+        // The plaintext index carries HMAC'd names and counters; clear it on
+        // scope exit like the rest of the key-handling in this file.
+        let index_bytes = Zeroizing::new(encode_index(&self.index)?);
 
         let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
         let aad = self.header.to_aad_bytes()?;
-        let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_json, &aad)?;
+        let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_bytes, &aad)?;
         drop(enc_key_bytes);
 
         let header_len = (header_json.len() as u32).to_le_bytes();
 
-        let mut output = Vec::with_capacity(
-            4 + header_json.len() + XCHACHA20_NONCE_LEN + 8 + encrypted_index.len(),
-        );
+        let mut output =
+            Vec::with_capacity(4 + header_json.len() + XCHACHA20_NONCE_LEN + encrypted_index.len());
         output.extend_from_slice(&header_len);
         output.extend_from_slice(&header_json);
         output.extend_from_slice(&self.index.nonce);
-        output.extend_from_slice(&self.index.nonce_counter.to_le_bytes());
         output.extend_from_slice(&encrypted_index);
 
         validate_export_size(output.len() as u64)?;
@@ -470,51 +450,20 @@ impl Vault {
 
         // Re-encrypt entries one at a time into new_vault, reading the old
         // ciphertexts in place.
-        for (old_hmac_key, meta) in &self.index.files {
-            // Dummy padding entries carry no payload; they are dropped on
-            // password change rather than re-encrypted.
-            if meta.is_dummy {
-                continue;
-            }
+        for (old_hmac_key, entry) in &self.index.files {
+            let old_aad = build_entry_aad(old_hmac_key, entry.data_counter);
 
-            // A real entry always stores both ciphertexts; a missing or
-            // undersized field means the (authenticated) index is
-            // inconsistent. Fail instead of silently dropping the entry.
-            let old_aad = build_entry_aad(old_hmac_key, meta.data_counter);
+            let (name_nonce, name_ct) = split_nonce(&entry.encrypted_name)?;
+            let name_bytes = open_with_aad(&old_enc_key, &name_nonce, name_ct, &old_aad)?;
+            let plaintext_name = Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
+                let mut bytes = e.into_bytes();
+                bytes.zeroize();
+                VaultError::CorruptedData("Invalid entry name".to_string())
+            })?);
 
-            let plaintext_name = match &meta.encrypted_name {
-                Some(enc_name) if enc_name.len() >= XCHACHA20_NONCE_LEN => {
-                    let nonce: [u8; XCHACHA20_NONCE_LEN] =
-                        enc_name[..XCHACHA20_NONCE_LEN].try_into().unwrap();
-                    let ct = &enc_name[XCHACHA20_NONCE_LEN..];
-                    let name_bytes = open_with_aad(&old_enc_key, &nonce, ct, &old_aad)?;
-                    Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
-                        let mut bytes = e.into_bytes();
-                        bytes.zeroize();
-                        VaultError::CorruptedData("Invalid entry name".to_string())
-                    })?)
-                }
-                _ => {
-                    return Err(VaultError::CorruptedData(
-                        "Entry is missing a valid encrypted name".to_string(),
-                    ));
-                }
-            };
-
-            let encrypted = match &meta.encrypted_data {
-                Some(enc) if enc.len() >= XCHACHA20_NONCE_LEN => enc,
-                _ => {
-                    return Err(VaultError::CorruptedData(
-                        "Entry is missing valid encrypted data".to_string(),
-                    ));
-                }
-            };
-
-            let nonce: [u8; XCHACHA20_NONCE_LEN] =
-                encrypted[..XCHACHA20_NONCE_LEN].try_into().unwrap();
-            let ciphertext = &encrypted[XCHACHA20_NONCE_LEN..];
+            let (data_nonce, data_ct) = split_nonce(&entry.encrypted_data)?;
             let plaintext =
-                Zeroizing::new(open_with_aad(&old_enc_key, &nonce, ciphertext, &old_aad)?);
+                Zeroizing::new(open_with_aad(&old_enc_key, &data_nonce, data_ct, &old_aad)?);
 
             new_vault.store(&plaintext_name, &plaintext)?;
         }
@@ -576,11 +525,9 @@ fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
     }
 
     let after_header = 4 + header_len;
-    let min_total = after_header + XCHACHA20_NONCE_LEN + 8;
-
-    if data.len() < min_total {
+    if data.len() < after_header + XCHACHA20_NONCE_LEN {
         return Err(VaultError::CorruptedData(
-            "Data too short for nonce and counter".to_string(),
+            "Data too short for header and nonce".to_string(),
         ));
     }
 
@@ -593,53 +540,25 @@ fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
         .try_into()
         .unwrap();
 
-    // The 8-byte counter after the nonce is not read (DESIGN.md 9.1).
-    let counter_start = after_header + XCHACHA20_NONCE_LEN;
-    let encrypted_index = &data[counter_start + 8..];
+    // Format version 1 wrote an 8-byte copy of the nonce counter after the
+    // nonce that was never read back; the authenticated copy inside the
+    // index is the one that counts. Skip it.
+    let mut index_start = after_header + XCHACHA20_NONCE_LEN;
+    if header.version == LEGACY_VAULT_VERSION_1 {
+        index_start += 8;
+        if data.len() < index_start {
+            return Err(VaultError::CorruptedData(
+                "Data too short for legacy counter".to_string(),
+            ));
+        }
+    }
+    let encrypted_index = &data[index_start..];
 
     Ok(Envelope {
         header,
         nonce,
         encrypted_index,
     })
-}
-
-/// The decrypted index JSON, in the shape `export` writes it.
-#[derive(serde::Deserialize)]
-struct IndexData {
-    version: u16,
-    nonce: [u8; XCHACHA20_NONCE_LEN],
-    nonce_counter: u64,
-    data_nonce_counter: u64,
-    files: HashMap<String, IndexMetaBlockMetadata>,
-}
-
-/// Step 7 of DESIGN.md section 2.1: decodes an index that has already been
-/// authenticated and checks it against the format bounds.
-fn decode_index(index_json: &[u8]) -> Result<IndexData, VaultError> {
-    let idx_data: IndexData = serde_json::from_slice(index_json)
-        .map_err(|e| VaultError::CorruptedData(format!("Invalid index JSON: {}", e)))?;
-
-    if !crate::constants::vault_index_constants::SUPPORTED_VAULT_INDEX_VERSIONS
-        .contains(&idx_data.version)
-    {
-        return Err(VaultError::CorruptedData(format!(
-            "Unsupported index version: {}",
-            idx_data.version
-        )));
-    }
-
-    let max_index_entries = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
-    if idx_data.files.len() > max_index_entries {
-        return Err(VaultError::CorruptedData(format!(
-            "Index entry count {} exceeds maximum {}",
-            idx_data.files.len(),
-            max_index_entries
-        )));
-    }
-
-    validate_entry_sizes(&idx_data.files)?;
-    Ok(idx_data)
 }
 
 fn validate_password(password: &[u8]) -> Result<(), VaultError> {
@@ -655,8 +574,8 @@ fn validate_password(password: &[u8]) -> Result<(), VaultError> {
 fn validate_header(header: &VaultHeader) -> Result<(), VaultError> {
     if !SUPPORTED_VAULT_VERSIONS.contains(&header.version) {
         return Err(VaultError::CorruptedData(format!(
-            "Unsupported vault version: {} (supported: {})",
-            header.version, VAULT_VERSION
+            "Unsupported vault version: {} (supported: {:?})",
+            header.version, SUPPORTED_VAULT_VERSIONS
         )));
     }
     if header.kdf_memory_cost > MAX_KDF_MEMORY || header.kdf_memory_cost < MIN_KDF_MEMORY {
@@ -692,31 +611,16 @@ fn validate_export_size(len: u64) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// Rejects an (already authenticated) index whose per-entry ciphertexts are
-/// larger than anything `store` can produce, so `retrieve` and
-/// `change_password` never allocate for a blob outside the documented bounds.
-fn validate_entry_sizes(files: &HashMap<String, IndexMetaBlockMetadata>) -> Result<(), VaultError> {
-    for meta in files.values() {
-        if let Some(data) = &meta.encrypted_data
-            && data.len() > MAX_ENCRYPTED_DATA_LEN
-        {
-            return Err(VaultError::CorruptedData(format!(
-                "Entry data ciphertext of {} bytes exceeds maximum {}",
-                data.len(),
-                MAX_ENCRYPTED_DATA_LEN
-            )));
-        }
-        if let Some(name) = &meta.encrypted_name
-            && name.len() > MAX_ENCRYPTED_NAME_LEN
-        {
-            return Err(VaultError::CorruptedData(format!(
-                "Entry name ciphertext of {} bytes exceeds maximum {}",
-                name.len(),
-                MAX_ENCRYPTED_NAME_LEN
-            )));
-        }
+/// Splits a stored blob into its 24-byte nonce prefix and the ciphertext.
+/// Decoders already reject shorter blobs; this is the in-memory guard.
+fn split_nonce(blob: &[u8]) -> Result<([u8; XCHACHA20_NONCE_LEN], &[u8]), VaultError> {
+    if blob.len() < XCHACHA20_NONCE_LEN {
+        return Err(VaultError::CorruptedData(
+            "Encrypted entry too short for nonce".to_string(),
+        ));
     }
-    Ok(())
+    let nonce: [u8; XCHACHA20_NONCE_LEN] = blob[..XCHACHA20_NONCE_LEN].try_into().unwrap();
+    Ok((nonce, &blob[XCHACHA20_NONCE_LEN..]))
 }
 
 fn build_entry_aad(hmac_key: &str, counter: u64) -> Vec<u8> {
@@ -765,6 +669,7 @@ fn derive_master_key(password: &[u8], header: &VaultHeader) -> Result<[u8; KEY_L
 mod tests {
     use super::*;
     use crate::constants::argon2;
+    use crate::vault::index_codec::{ENTRY_KEY_LEN, MAX_ENCRYPTED_NAME_LEN, MIN_ENCRYPTED_LEN};
 
     #[test]
     fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
@@ -1138,9 +1043,9 @@ mod tests {
         assert!(Vault::open(b"password", &data).is_err());
     }
 
-    // Direct tests of the pre-authentication parser and the index decoder.
-    // Both run without Argon2, so they are cheap; the end-to-end variants
-    // below exercise the same checks through open().
+    // Direct test of the pre-authentication parser. It runs without
+    // Argon2; the end-to-end variants below exercise the same checks through
+    // open(). The index decoders have their own tests in index_codec.
 
     #[test]
     fn parse_envelope_splits_a_valid_export() {
@@ -1149,6 +1054,7 @@ mod tests {
         let data = vault.export().unwrap();
 
         let envelope = parse_envelope(&data).unwrap();
+        assert_eq!(envelope.header.version, VAULT_VERSION);
         assert_eq!(
             envelope.header.to_aad_bytes().unwrap(),
             vault.header.to_aad_bytes().unwrap()
@@ -1157,59 +1063,114 @@ mod tests {
         let header_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
         assert_eq!(
             envelope.encrypted_index.len(),
-            data.len() - (4 + header_len + XCHACHA20_NONCE_LEN + 8)
+            data.len() - (4 + header_len + XCHACHA20_NONCE_LEN)
         );
     }
 
+    // Format version 1 compatibility. The fixture was written by memseal
+    // 0.2.1 (JSON index, 8-byte counter after the nonce) and holds four
+    // entries; a fifth was stored and removed before saving.
+
+    const V1_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/vault_v1.seal");
+    const V1_PASSWORD: &[u8] = b"fixture-password-v1";
+
+    fn assert_fixture_entries(vault: &Vault) {
+        assert_eq!(vault.index.files.len(), 4);
+        assert_eq!(
+            vault.retrieve("api_key").unwrap(),
+            Some(b"sk-fixture-12345-v2".to_vec())
+        );
+        assert_eq!(vault.retrieve("empty").unwrap(), Some(Vec::new()));
+        assert_eq!(
+            vault.retrieve(&"n".repeat(255)).unwrap(),
+            Some(b"longest name".to_vec())
+        );
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
+        assert_eq!(vault.retrieve("blob").unwrap(), Some(payload));
+        assert_eq!(vault.retrieve("gone").unwrap(), None);
+    }
+
     #[test]
-    fn decode_index_rejects_wrong_version_and_malformed_json() {
-        let nonce = vec![0u8; XCHACHA20_NONCE_LEN];
-        let json = serde_json::json!({
-            "version": 999,
-            "nonce": nonce,
-            "nonce_counter": 0u64,
-            "data_nonce_counter": 0u64,
-            "files": {},
-        });
-        match decode_index(&serde_json::to_vec(&json).unwrap()) {
-            Err(VaultError::CorruptedData(msg)) => assert!(msg.contains("version"), "{}", msg),
-            other => panic!("unexpected: {:?}", other.map(|_| ())),
-        }
+    fn v1_fixture_opens_and_is_rewritten_as_current_format() {
+        let envelope = parse_envelope(V1_FIXTURE).unwrap();
+        assert_eq!(envelope.header.version, LEGACY_VAULT_VERSION_1);
+
+        let mut vault = Vault::open(V1_PASSWORD, V1_FIXTURE).unwrap();
+        assert_fixture_entries(&vault);
+        // The in-memory vault is upgraded: the next export writes version 2.
+        assert_eq!(vault.header.version, VAULT_VERSION);
+
+        let exported = vault.export().unwrap();
+        assert_eq!(
+            parse_envelope(&exported).unwrap().header.version,
+            VAULT_VERSION
+        );
+        // Entry ciphertexts are carried over unchanged, so the binary export
+        // is far smaller than the JSON original.
+        assert!(exported.len() < V1_FIXTURE.len() / 2);
+
+        let reopened = Vault::open(V1_PASSWORD, &exported).unwrap();
+        assert_fixture_entries(&reopened);
+
+        // Still writable after migration.
+        let mut reopened = reopened;
+        reopened.store("new", b"after migration").unwrap();
+        let again = Vault::open(V1_PASSWORD, &reopened.export().unwrap()).unwrap();
+        assert_eq!(
+            again.retrieve("new").unwrap(),
+            Some(b"after migration".to_vec())
+        );
+        assert_eq!(again.index.files.len(), 5);
+    }
+
+    #[test]
+    fn v1_fixture_rejects_wrong_password() {
         assert!(matches!(
-            decode_index(b"{not json"),
+            Vault::open(b"wrong-password!", V1_FIXTURE),
+            Err(VaultError::InvalidPassword)
+        ));
+    }
+
+    #[test]
+    fn v1_fixture_ignores_the_unauthenticated_counter_bytes() {
+        // Format 1 wrote 8 bytes of nonce counter after the nonce that were
+        // never read back; the legacy reader skips them, so flipping every
+        // bit must not change the outcome.
+        let header_len = u32::from_le_bytes(V1_FIXTURE[..4].try_into().unwrap()) as usize;
+        let counter_start = 4 + header_len + XCHACHA20_NONCE_LEN;
+        let mut tampered = V1_FIXTURE.to_vec();
+        for b in &mut tampered[counter_start..counter_start + 8] {
+            *b ^= 0xFF;
+        }
+        let vault = Vault::open(V1_PASSWORD, &tampered).unwrap();
+        assert_fixture_entries(&vault);
+    }
+
+    #[test]
+    fn v1_fixture_truncated_inside_counter_is_rejected() {
+        let header_len = u32::from_le_bytes(V1_FIXTURE[..4].try_into().unwrap()) as usize;
+        let cut = 4 + header_len + XCHACHA20_NONCE_LEN + 4;
+        assert!(matches!(
+            Vault::open(V1_PASSWORD, &V1_FIXTURE[..cut]),
             Err(VaultError::CorruptedData(_))
         ));
     }
 
     #[test]
-    fn decode_index_rejects_entry_count_over_cap() {
-        let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
-        let mut files = serde_json::Map::new();
-        for i in 0..=max {
-            files.insert(
-                format!("{:064x}", i),
-                serde_json::json!({
-                    "location": "Inline",
-                    "created": 0,
-                    "modified": 0,
-                    "is_dummy": true,
-                    "encrypted_data": null,
-                    "encrypted_name": null,
-                    "data_counter": 0,
-                }),
-            );
-        }
-        let nonce = vec![0u8; XCHACHA20_NONCE_LEN];
-        let json = serde_json::json!({
-            "version": crate::constants::vault_index_constants::VAULT_INDEX_VERSION,
-            "nonce": nonce,
-            "nonce_counter": 0u64,
-            "data_nonce_counter": 1u64,
-            "files": files,
-        });
+    fn current_format_export_does_not_carry_the_legacy_counter() {
+        // A version 2 envelope goes straight from the nonce to the
+        // ciphertext. Reading it as if the 8 legacy bytes were present (or
+        // flipping the bytes right after the nonce) must fail the AEAD.
+        let password: &[u8] = b"password-v2-layout";
+        let valid = make_valid_export(password);
+        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let after_nonce = 4 + header_len + XCHACHA20_NONCE_LEN;
+
+        let mut tampered = valid.clone();
+        tampered[after_nonce] ^= 0xFF;
         assert!(matches!(
-            decode_index(&serde_json::to_vec(&json).unwrap()),
-            Err(VaultError::CorruptedData(_))
+            Vault::open(password, &tampered),
+            Err(VaultError::InvalidPassword)
         ));
     }
 
@@ -1239,7 +1200,7 @@ mod tests {
     fn open_rejects_zero_header_len() {
         // 4 bytes containing header_len=0, plus enough trailing bytes to clear
         // the size check. Header JSON region is empty so deserialization fails.
-        let mut data = vec![0u8; 4 + XCHACHA20_NONCE_LEN + 8];
+        let mut data = vec![0u8; 4 + XCHACHA20_NONCE_LEN];
         data[..4].copy_from_slice(&0u32.to_le_bytes());
         let result = Vault::open(b"password", &data);
         assert!(matches!(result, Err(VaultError::CorruptedData(_))));
@@ -1248,7 +1209,7 @@ mod tests {
     #[test]
     fn open_rejects_header_len_exceeding_available_bytes() {
         // header_len within MAX_HEADER_JSON_LEN but larger than provided bytes.
-        // Exercises the `data.len() < min_total` branch, distinct from the
+        // Exercises the size branch, distinct from the
         // `header_len > MAX_HEADER_JSON_LEN` branch covered by
         // `header_len_overflow_rejected` and the cap tests below.
         let mut data = vec![0u8; 64];
@@ -1262,7 +1223,7 @@ mod tests {
         // Enough bytes are present for the declared header, so the only
         // reason to fail is the cap itself; the JSON must never be parsed.
         let header_len = MAX_HEADER_JSON_LEN + 1;
-        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN + 8];
+        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN];
         data[..4].copy_from_slice(&(header_len as u32).to_le_bytes());
         match Vault::open(b"password", &data) {
             Err(VaultError::CorruptedData(msg)) => {
@@ -1278,7 +1239,7 @@ mod tests {
         // Exactly at the cap the length check passes and the (garbage)
         // header reaches the JSON parser, which rejects it.
         let header_len = MAX_HEADER_JSON_LEN;
-        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN + 8];
+        let mut data = vec![b'{'; 4 + header_len + XCHACHA20_NONCE_LEN];
         data[..4].copy_from_slice(&(header_len as u32).to_le_bytes());
         match Vault::open(b"password", &data) {
             Err(VaultError::CorruptedData(msg)) => {
@@ -1306,25 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_truncation_inside_counter_region() {
-        // Truncate a valid export inside the 8-byte counter region.
-        let valid = make_valid_export(b"password-bbbb");
-        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
-        let counter_start = 4 + header_len + XCHACHA20_NONCE_LEN;
-        // Keep half of the counter so the size check fails.
-        let truncated = &valid[..counter_start + 4];
-        let result = Vault::open(b"password-bbbb", truncated);
-        assert!(matches!(result, Err(VaultError::CorruptedData(_))));
-    }
-
-    #[test]
-    fn open_rejects_missing_ciphertext_after_counter() {
-        // Header + nonce + counter present, but the ciphertext region is empty
-        // (no AEAD tag). The size check passes; AEAD must reject the input.
+    fn open_rejects_missing_ciphertext_after_nonce() {
+        // Header and nonce present, but the ciphertext region is empty (no
+        // AEAD tag). The size check passes; AEAD must reject the input.
         // `open_with_aad` failures are surfaced as `InvalidPassword` by design.
         let valid = make_valid_export(b"password-cccc");
         let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
-        let cut = 4 + header_len + XCHACHA20_NONCE_LEN + 8;
+        let cut = 4 + header_len + XCHACHA20_NONCE_LEN;
         let truncated = &valid[..cut];
         let result = Vault::open(b"password-cccc", truncated);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
@@ -1384,6 +1333,25 @@ mod tests {
         let tampered = replace_header_json(&valid, &new_json);
         let result = Vault::open(b"password-ffff", &tampered);
         assert!(matches!(result, Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn open_rejects_version_downgrade_in_header() {
+        // Rewriting a version 2 header as version 1 changes the AAD (and
+        // would make the reader skip 8 bytes of ciphertext), so the AEAD
+        // must fail: a legacy-format downgrade cannot be forged.
+        let valid = make_valid_export(b"password-downgrade");
+        let mut value = extract_header_value(&valid);
+        value.as_object_mut().unwrap().insert(
+            "version".to_string(),
+            serde_json::Value::Number(LEGACY_VAULT_VERSION_1.into()),
+        );
+        let new_json = serde_json::to_vec(&value).unwrap();
+        let tampered = replace_header_json(&valid, &new_json);
+        assert!(matches!(
+            Vault::open(b"password-downgrade", &tampered),
+            Err(VaultError::InvalidPassword)
+        ));
     }
 
     #[test]
@@ -1457,11 +1425,8 @@ mod tests {
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
 
-    // Tampering group C: nonce and counter region tampering.
-    // The nonce is part of the AEAD construction; tampering must surface as
-    // an AEAD failure. The counter field stored in the file at the fixed
-    // offset is an export of vault state but is not consumed by `open()`
-    // (the authoritative counter values are inside the encrypted index JSON).
+    // Tampering group C: nonce region tampering. The nonce is part of the
+    // AEAD construction; tampering must surface as an AEAD failure.
 
     #[test]
     fn open_rejects_bit_flipped_nonce() {
@@ -1476,35 +1441,6 @@ mod tests {
 
         let result = Vault::open(password, &tampered);
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
-    }
-
-    #[test]
-    fn open_ignores_counter_field_in_file() {
-        // The 8-byte counter field written by `export()` at offset
-        // `4 + header_len + 24` is never read back by `open()`; the
-        // authoritative counter is recovered from the encrypted index JSON.
-        // This test pins that behavior: flipping every bit of those 8 bytes
-        // must NOT change the outcome of `open()`. If this test ever starts
-        // failing, the file format is being used differently and the layout
-        // should be revisited (the 8 bytes are otherwise wire-format dead
-        // weight that should either be removed or actually consumed).
-        let password: &[u8] = b"password-jjjj";
-        let valid = make_valid_export(password);
-        let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
-        let counter_start = 4 + header_len + XCHACHA20_NONCE_LEN;
-
-        let mut tampered = valid.clone();
-        for i in 0..8 {
-            tampered[counter_start + i] ^= 0xFF;
-        }
-
-        let from_valid = Vault::open(password, &valid).unwrap();
-        let from_tampered = Vault::open(password, &tampered).unwrap();
-        // Both opens succeed and recover the same authoritative counter.
-        assert_eq!(
-            from_valid.index.nonce_counter,
-            from_tampered.index.nonce_counter
-        );
     }
 
     #[test]
@@ -1553,7 +1489,7 @@ mod tests {
 
     fn ciphertext_offset(export: &[u8]) -> usize {
         let header_len = u32::from_le_bytes(export[..4].try_into().unwrap()) as usize;
-        4 + header_len + XCHACHA20_NONCE_LEN + 8
+        4 + header_len + XCHACHA20_NONCE_LEN
     }
 
     #[test]
@@ -1615,46 +1551,26 @@ mod tests {
         assert!(matches!(result, Err(VaultError::InvalidPassword)));
     }
 
-    // Tampering group E: index entry-count cap.
-    // `open()` must reject an index whose decoded `files` map exceeds
-    // MAX_INDEX_ENTRIES, even though the bytes are validly sealed under the
-    // correct key. This guards against a crafted index forcing a larger
-    // in-memory map than the format allows.
+    // Tampering group E: authenticated but out-of-bounds indexes.
+    // `open()` must reject an index whose decoded contents exceed the format
+    // bounds, even though the bytes are validly sealed under the correct
+    // key. This guards against a crafted index forcing a larger in-memory
+    // map or larger blobs than the format allows.
 
-    /// Forges a vault export whose encrypted index contains `entry_count`
-    /// dummy entries, sealed correctly under the key derived from `password`.
-    fn forge_export_with_entries(password: &[u8], entry_count: usize) -> Vec<u8> {
-        let mut files = HashMap::new();
-        for i in 0..entry_count {
-            files.insert(
-                format!("{:064x}", i),
-                IndexMetaBlockMetadata::new(
-                    IndexMetaBlockLocation::Inline,
-                    0,
-                    0,
-                    true,
-                    None,
-                    None,
-                    0,
-                ),
-            );
-        }
-        forge_export_with_files(password, files)
-    }
-
-    /// Forges a vault export whose encrypted index holds exactly `files`,
-    /// sealed correctly under the key derived from `password`. Entries must
-    /// use `data_counter` 0.
-    fn forge_export_with_files(
+    /// Forges a vault export whose encrypted index holds exactly `entries`
+    /// (declaring `declared_count` of them), sealed correctly under the key
+    /// derived from `password`. Entries must use `data_counter` 0.
+    fn forge_export(
         password: &[u8],
-        files: HashMap<String, IndexMetaBlockMetadata>,
+        declared_count: u32,
+        entries: &[([u8; ENTRY_KEY_LEN], IndexEntry)],
     ) -> Vec<u8> {
-        use crate::vault::vault_index::derive_subkeys;
+        use crate::vault::index_codec::tests::raw_encode;
 
         let header = VaultHeader::generate().unwrap();
-        let mut master_key = derive_master_key(password, &header).unwrap();
-        let (mut enc_sub, _hmac_sub) = derive_subkeys(&master_key, &header.kdf_salt).unwrap();
-        master_key.zeroize();
+        let master_key = Zeroizing::new(derive_master_key(password, &header).unwrap());
+        let (enc_sub, _hmac_sub) = derive_subkeys(master_key.as_slice(), &header.kdf_salt).unwrap();
+        let enc_sub = Zeroizing::new(enc_sub);
 
         // Any unique nonce works: open() reads the nonce from the file and
         // never re-derives it.
@@ -1662,28 +1578,37 @@ mod tests {
         secure_bytes_fill(&mut nonce).unwrap();
 
         // All forged entries use data_counter 0, so data_nonce_counter must be
-        // at least 1 to satisfy the nonce-counter invariant enforced on open.
-        let index_json = serde_json::json!({
-            "version": crate::constants::vault_index_constants::VAULT_INDEX_VERSION,
-            "nonce": nonce.to_vec(),
-            "nonce_counter": 1u64,
-            "data_nonce_counter": 1u64,
-            "files": files,
-        });
-        let index_bytes = serde_json::to_vec(&index_json).unwrap();
+        // at least 1 to satisfy the counter invariant enforced on open.
+        let index_bytes = raw_encode(
+            crate::constants::vault_index_constants::VAULT_INDEX_VERSION,
+            1,
+            1,
+            declared_count,
+            entries,
+        );
 
         let aad = header.to_aad_bytes().unwrap();
         let encrypted_index = seal_with_aad(&enc_sub, &nonce, &index_bytes, &aad).unwrap();
-        enc_sub.zeroize();
 
         let header_json = serde_json::to_vec(&header).unwrap();
         let mut output = Vec::new();
         output.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
         output.extend_from_slice(&header_json);
         output.extend_from_slice(&nonce);
-        output.extend_from_slice(&1u64.to_le_bytes());
         output.extend_from_slice(&encrypted_index);
         output
+    }
+
+    fn forge_export_with_entries(password: &[u8], entry_count: usize) -> Vec<u8> {
+        use crate::vault::index_codec::tests::entry;
+        let entries: Vec<([u8; ENTRY_KEY_LEN], IndexEntry)> = (0..entry_count)
+            .map(|i| {
+                let mut key = [0u8; ENTRY_KEY_LEN];
+                key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                (key, entry(0, MIN_ENCRYPTED_LEN, MIN_ENCRYPTED_LEN))
+            })
+            .collect();
+        forge_export(password, entry_count as u32, &entries)
     }
 
     #[test]
@@ -1692,7 +1617,8 @@ mod tests {
         let max = crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
         let data = forge_export_with_entries(password, max);
         // Sealed correctly and at the cap: open must succeed.
-        assert!(Vault::open(password, &data).is_ok());
+        let vault = Vault::open(password, &data).unwrap();
+        assert_eq!(vault.index.files.len(), max);
     }
 
     #[test]
@@ -1707,59 +1633,15 @@ mod tests {
         ));
     }
 
-    // Per-entry ciphertext bounds. `store` can never produce blobs above
-    // these sizes, so an authenticated index that contains one is rejected
-    // on open instead of being allocated for later by retrieve.
-
-    fn single_entry_files(
-        encrypted_data: Option<Vec<u8>>,
-        encrypted_name: Option<Vec<u8>>,
-    ) -> HashMap<String, IndexMetaBlockMetadata> {
-        let mut files = HashMap::new();
-        files.insert(
-            format!("{:064x}", 0),
-            IndexMetaBlockMetadata::new(
-                IndexMetaBlockLocation::Inline,
-                0,
-                0,
-                false,
-                encrypted_data,
-                encrypted_name,
-                0,
-            ),
-        );
-        files
-    }
-
-    #[test]
-    fn validate_entry_sizes_bounds_are_inclusive() {
-        let at_bound = single_entry_files(
-            Some(vec![0u8; MAX_ENCRYPTED_DATA_LEN]),
-            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN]),
-        );
-        assert!(validate_entry_sizes(&at_bound).is_ok());
-
-        let data_over = single_entry_files(Some(vec![0u8; MAX_ENCRYPTED_DATA_LEN + 1]), None);
-        assert!(matches!(
-            validate_entry_sizes(&data_over),
-            Err(VaultError::CorruptedData(_))
-        ));
-
-        let name_over = single_entry_files(None, Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN + 1]));
-        assert!(matches!(
-            validate_entry_sizes(&name_over),
-            Err(VaultError::CorruptedData(_))
-        ));
-    }
-
     #[test]
     fn open_rejects_entry_name_ciphertext_over_bound() {
+        use crate::vault::index_codec::tests::entry;
         let password: &[u8] = b"password-name-big";
-        let files = single_entry_files(
-            Some(vec![0u8; XCHACHA20_NONCE_LEN + POLY1305_OUTSIZE]),
-            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN + 1]),
-        );
-        let data = forge_export_with_files(password, files);
+        let entries = [(
+            [1u8; ENTRY_KEY_LEN],
+            entry(0, MAX_ENCRYPTED_NAME_LEN + 1, MIN_ENCRYPTED_LEN),
+        )];
+        let data = forge_export(password, 1, &entries);
         assert!(matches!(
             Vault::open(password, &data),
             Err(VaultError::CorruptedData(_))
@@ -1768,15 +1650,40 @@ mod tests {
 
     #[test]
     fn open_accepts_entry_ciphertexts_at_bound() {
+        use crate::vault::index_codec::tests::entry;
         // Sizes exactly at the bound pass the structural check; the blobs
         // are garbage, so a later retrieve fails on the AEAD, not on open.
         let password: &[u8] = b"password-name-max";
-        let files = single_entry_files(
-            Some(vec![0u8; XCHACHA20_NONCE_LEN + POLY1305_OUTSIZE]),
-            Some(vec![0u8; MAX_ENCRYPTED_NAME_LEN]),
-        );
-        let data = forge_export_with_files(password, files);
-        assert!(Vault::open(password, &data).is_ok());
+        let entries = [(
+            [1u8; ENTRY_KEY_LEN],
+            entry(0, MAX_ENCRYPTED_NAME_LEN, MIN_ENCRYPTED_LEN),
+        )];
+        let data = forge_export(password, 1, &entries);
+        let vault = Vault::open(password, &data).unwrap();
+        assert_eq!(vault.index.files.len(), 1);
+    }
+
+    #[test]
+    fn open_rejects_index_with_trailing_bytes() {
+        use crate::vault::index_codec::tests::entry;
+        // Declares one entry but carries two: the decoder must not ignore
+        // the bytes after the last declared entry.
+        let password: &[u8] = b"password-trailing";
+        let entries = [
+            (
+                [1u8; ENTRY_KEY_LEN],
+                entry(0, MIN_ENCRYPTED_LEN, MIN_ENCRYPTED_LEN),
+            ),
+            (
+                [2u8; ENTRY_KEY_LEN],
+                entry(0, MIN_ENCRYPTED_LEN, MIN_ENCRYPTED_LEN),
+            ),
+        ];
+        let data = forge_export(password, 1, &entries);
+        assert!(matches!(
+            Vault::open(password, &data),
+            Err(VaultError::CorruptedData(_))
+        ));
     }
 
     // Group F: export size bound and nonce freshness.
@@ -1790,11 +1697,10 @@ mod tests {
         ));
     }
 
-    /// Slowest test in the suite (tens of seconds in debug): it materializes
-    /// an export just above the 256 MiB cap to pin the guarantee end to end.
-    /// Encrypted bytes serialize into the index JSON as number arrays at
-    /// roughly 3.6 output bytes per stored byte, so 74 MiB of plaintext is
-    /// enough to cross the cap.
+    /// Slowest test in the suite (tens of seconds in debug, about 1 GiB of
+    /// peak memory): it materializes an export just above the 256 MiB cap to
+    /// pin the guarantee end to end. The binary index adds only a few bytes
+    /// per entry, so four entries of the maximum size are needed.
     #[test]
     fn export_rejects_vault_exceeding_max_file_size() {
         fn pseudo_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -1804,12 +1710,10 @@ mod tests {
         }
 
         let mut vault = Vault::create(b"password-size-cap").unwrap();
-        vault
-            .store("a", &pseudo_bytes(37 * 1024 * 1024, 1))
-            .unwrap();
-        vault
-            .store("b", &pseudo_bytes(37 * 1024 * 1024, 2))
-            .unwrap();
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            let payload = Zeroizing::new(pseudo_bytes(MAX_ENTRY_DATA_SIZE, i as u64 + 1));
+            vault.store(name, &payload).unwrap();
+        }
 
         assert!(matches!(
             vault.export(),
@@ -1818,11 +1722,14 @@ mod tests {
 
         // The vault stays intact and usable: dropping one entry brings the
         // export back under the cap.
-        assert!(vault.remove("b").unwrap());
+        assert!(vault.remove("d").unwrap());
         let exported = vault.export().unwrap();
         assert!(exported.len() as u64 <= MAX_VAULT_FILE_SIZE);
         let reopened = Vault::open(b"password-size-cap", &exported).unwrap();
-        assert!(reopened.retrieve("a").unwrap().is_some());
+        assert_eq!(
+            reopened.with_secret("a", |p| p.len()).unwrap(),
+            Some(MAX_ENTRY_DATA_SIZE)
+        );
     }
 
     #[test]
@@ -1835,49 +1742,37 @@ mod tests {
             .index
             .files
             .values()
-            .map(|m| m.encrypted_data.as_ref().unwrap()[..XCHACHA20_NONCE_LEN].to_vec())
+            .map(|e| e.encrypted_data[..XCHACHA20_NONCE_LEN].to_vec())
             .collect();
         vault.store("k", b"v1").unwrap();
         let second: Vec<Vec<u8>> = vault
             .index
             .files
             .values()
-            .map(|m| m.encrypted_data.as_ref().unwrap()[..XCHACHA20_NONCE_LEN].to_vec())
+            .map(|e| e.encrypted_data[..XCHACHA20_NONCE_LEN].to_vec())
             .collect();
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_ne!(first[0], second[0]);
     }
 
-    // Group G: change_password handling of dummy and inconsistent entries.
+    // Group G: change_password with an inconsistent in-memory entry.
 
     #[test]
-    fn change_password_drops_dummies_and_keeps_real_entries() {
+    fn change_password_rejects_entry_with_undersized_ciphertext() {
         let mut vault = Vault::create(b"old-password").unwrap();
         vault.store("real", b"payload").unwrap();
-        vault.index.files.insert(
-            format!("{:064x}", 0),
-            IndexMetaBlockMetadata::new(IndexMetaBlockLocation::Inline, 0, 0, true, None, None, 0),
-        );
-
-        vault
-            .change_password(b"old-password", b"new-password")
-            .unwrap();
-
-        assert_eq!(vault.retrieve("real").unwrap(), Some(b"payload".to_vec()));
-        // Only the re-encrypted real entry survives.
-        assert_eq!(vault.index.files.len(), 1);
-    }
-
-    #[test]
-    fn change_password_rejects_real_entry_missing_ciphertext() {
-        let mut vault = Vault::create(b"old-password").unwrap();
-        vault.store("real", b"payload").unwrap();
-        // Non-dummy entry without ciphertext fields: the index is
+        // An entry whose name blob cannot even hold a nonce: the index is
         // inconsistent and the password change must fail, not silently drop.
+        // (The decoders never produce such an entry; this is the in-memory
+        // guard.)
         vault.index.files.insert(
             format!("{:064x}", 1),
-            IndexMetaBlockMetadata::new(IndexMetaBlockLocation::Inline, 0, 0, false, None, None, 0),
+            IndexEntry {
+                data_counter: 0,
+                encrypted_name: vec![0u8; 3],
+                encrypted_data: vec![0u8; 40],
+            },
         );
 
         assert!(matches!(

@@ -1,24 +1,18 @@
 use crate::constants::subkeys::{ENCRYPTION_SUBKEY_INFO, HMAC_SUBKEY_INFO, SUBKEY_LEN};
-use crate::constants::vault_index_constants::{
-    MAX_INDEX_ENTRIES, SUPPORTED_VAULT_INDEX_VERSIONS, VAULT_INDEX_VERSION,
-};
+use crate::constants::vault_index_constants::MAX_INDEX_ENTRIES;
 use crate::constants::xchacha20_poly1305::XCHACHA20_NONCE_LEN;
 use crate::crypto::utils::{RandomError, secure_bytes_fill};
 use crate::mem::locked_secret::{LockedSecret, LockedSecretError};
+use crate::vault::index_codec::key_to_hex;
 use orion::hazardous::kdf::hkdf;
 use orion::hazardous::mac::hmac::sha256::{HmacSha256, SecretKey as HmacSecretKey};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Write as FmtWrite;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Errors that can occur in vault index operations.
 #[derive(Debug, Error)]
 pub enum IndexError {
-    /// The index version is not one this build can read.
-    #[error("Unsupported index version")]
-    UnsupportedVersion,
     /// The (authenticated) index violates one of its own invariants.
     #[error("Index inconsistent: {0}")]
     Inconsistent(String),
@@ -39,53 +33,31 @@ pub enum IndexError {
     Crypto(String),
 }
 
-/// Where an entry's data is stored.
-///
-/// Only `Inline` is produced today; the other variants are part of the
-/// serialized index format and are kept so existing vaults deserialize.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Zeroize)]
-pub enum IndexMetaBlockLocation {
-    LargeFile {
-        metablock_uid: String,
-    },
-    SmallFileInPack {
-        metablock_uid: String,
-        offset: usize,
-    },
-    Inline,
-}
-
-/// Metadata for a single entry in the vault index.
+/// One stored secret: both ciphertexts carry their 24-byte nonce prefix and
+/// are bound to `data_counter` through the entry AAD (DESIGN.md section 8).
 ///
 /// Zeroized on drop, so ciphertexts that are replaced, removed, or released
 /// with the vault do not linger in freed memory.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
-pub struct IndexMetaBlockMetadata {
-    pub location: IndexMetaBlockLocation,
-    pub created: u64,
-    pub modified: u64,
-    pub is_dummy: bool,
-    pub encrypted_data: Option<Vec<u8>>,
-    pub encrypted_name: Option<Vec<u8>>,
+#[derive(Debug, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct IndexEntry {
     pub data_counter: u64,
+    pub encrypted_name: Vec<u8>,
+    pub encrypted_data: Vec<u8>,
 }
 
-/// Encrypted index mapping HMAC'd entry names to their metadata.
+/// In-memory index mapping HMAC'd entry names to their ciphertexts.
 ///
 /// Entries are keyed by `hmac_key_for_name(plaintext_name)`; callers compute
 /// that key once and use it both for the map and for the entry AAD. The
 /// `Vault` facade advances the index nonce via `advance_nonce()` before each
 /// export.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct VaultIndex {
-    pub version: u16,
     pub nonce: [u8; XCHACHA20_NONCE_LEN],
     pub nonce_counter: u64,
     pub data_nonce_counter: u64,
-    pub files: HashMap<String, IndexMetaBlockMetadata>,
-    #[serde(skip)]
+    pub files: HashMap<String, IndexEntry>,
     enc_key: LockedSecret,
-    #[serde(skip)]
     hmac_key: LockedSecret,
 }
 
@@ -151,13 +123,7 @@ impl VaultIndex {
             HmacSha256::hmac(&hmac_key, plaintext_name.as_bytes())
                 .map_err(|_| IndexError::Crypto("HMAC failed".to_string()))
         })?;
-
-        let tag_bytes = tag.unprotected_as_bytes();
-        let mut hex = String::with_capacity(tag_bytes.len() * 2);
-        for b in tag_bytes {
-            write!(hex, "{:02x}", b).unwrap();
-        }
-        Ok(hex)
+        Ok(key_to_hex(tag.unprotected_as_bytes()))
     }
 
     /// Inserts an entry under an already computed `hmac_key_for_name` key.
@@ -166,50 +132,26 @@ impl VaultIndex {
     pub fn insert_by_key(
         &mut self,
         hashed_key: String,
-        metadata: IndexMetaBlockMetadata,
+        entry: IndexEntry,
     ) -> Result<(), IndexError> {
         // The cap applies to the map size; overwriting an existing entry does
         // not grow the map and stays allowed at the cap.
         if self.files.len() >= MAX_INDEX_ENTRIES && !self.files.contains_key(&hashed_key) {
             return Err(IndexError::Full(MAX_INDEX_ENTRIES));
         }
-        self.files.insert(hashed_key, metadata);
+        self.files.insert(hashed_key, entry);
         Ok(())
     }
 
     /// Looks up an entry by its `hmac_key_for_name` key.
-    pub fn lookup_by_key(&self, hashed_key: &str) -> Option<&IndexMetaBlockMetadata> {
+    pub fn lookup_by_key(&self, hashed_key: &str) -> Option<&IndexEntry> {
         self.files.get(hashed_key)
     }
 
-    /// Removes an entry by its `hmac_key_for_name` key. Returns the metadata
-    /// if it existed.
-    pub fn remove_by_key(&mut self, hashed_key: &str) -> Option<IndexMetaBlockMetadata> {
+    /// Removes an entry by its `hmac_key_for_name` key. Returns the entry if
+    /// it existed.
+    pub fn remove_by_key(&mut self, hashed_key: &str) -> Option<IndexEntry> {
         self.files.remove(hashed_key)
-    }
-
-    /// Constructs an index from pre-existing data (used when opening a vault).
-    pub fn from_data(
-        version: u16,
-        nonce: [u8; XCHACHA20_NONCE_LEN],
-        nonce_counter: u64,
-        data_nonce_counter: u64,
-        enc_key: LockedSecret,
-        hmac_key: LockedSecret,
-        files: HashMap<String, IndexMetaBlockMetadata>,
-    ) -> Result<Self, IndexError> {
-        if !SUPPORTED_VAULT_INDEX_VERSIONS.contains(&version) {
-            return Err(IndexError::UnsupportedVersion);
-        }
-        Ok(VaultIndex {
-            version,
-            nonce,
-            nonce_counter,
-            data_nonce_counter,
-            files,
-            enc_key,
-            hmac_key,
-        })
     }
 
     /// Creates a new empty index from an externally-derived master key and salt.
@@ -221,21 +163,17 @@ impl VaultIndex {
         let mut nonce = [0u8; XCHACHA20_NONCE_LEN];
         secure_bytes_fill(&mut nonce)?;
 
-        let enc_key = LockedSecret::new(enc_sub.as_slice())?;
-        let hmac_key = LockedSecret::new(hmac_sub.as_slice())?;
-
-        VaultIndex::from_data(
-            VAULT_INDEX_VERSION,
+        Ok(VaultIndex {
             nonce,
-            0,
-            0,
-            enc_key,
-            hmac_key,
-            HashMap::new(),
-        )
+            nonce_counter: 0,
+            data_nonce_counter: 0,
+            files: HashMap::new(),
+            enc_key: LockedSecret::new(enc_sub.as_slice())?,
+            hmac_key: LockedSecret::new(hmac_sub.as_slice())?,
+        })
     }
 
-    /// Reconstructs an index from already-derived subkeys and deserialized
+    /// Reconstructs an index from already-derived subkeys and decoded
     /// fields. `Vault::open` uses this so that HKDF runs exactly once per
     /// open; the caller owns and zeroizes `enc_sub` and `hmac_sub`.
     pub fn from_subkeys_and_data(
@@ -244,7 +182,7 @@ impl VaultIndex {
         nonce: [u8; XCHACHA20_NONCE_LEN],
         nonce_counter: u64,
         data_nonce_counter: u64,
-        files: HashMap<String, IndexMetaBlockMetadata>,
+        files: HashMap<String, IndexEntry>,
     ) -> Result<Self, IndexError> {
         // Entry nonces are random and stored with each ciphertext (DESIGN.md
         // section 5), so this check is not about nonce uniqueness. The
@@ -264,18 +202,14 @@ impl VaultIndex {
             )));
         }
 
-        let enc_key = LockedSecret::new(enc_sub)?;
-        let hmac_key = LockedSecret::new(hmac_sub)?;
-
-        VaultIndex::from_data(
-            VAULT_INDEX_VERSION,
+        Ok(VaultIndex {
             nonce,
             nonce_counter,
             data_nonce_counter,
-            enc_key,
-            hmac_key,
             files,
-        )
+            enc_key: LockedSecret::new(enc_sub)?,
+            hmac_key: LockedSecret::new(hmac_sub)?,
+        })
     }
 }
 
@@ -284,34 +218,10 @@ impl Drop for VaultIndex {
         // Entry values zeroize themselves on drop. Wipe the HMAC-derived map
         // keys and the index nonce as well so no index metadata lingers in
         // freed memory. The subkey containers have their own Drop.
-        for (mut key, _meta) in self.files.drain() {
+        for (mut key, _entry) in self.files.drain() {
             key.zeroize();
         }
         self.nonce.zeroize();
-    }
-}
-
-impl IndexMetaBlockMetadata {
-    /// Creates entry metadata with explicit fields.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        location: IndexMetaBlockLocation,
-        created: u64,
-        modified: u64,
-        is_dummy: bool,
-        encrypted_data: Option<Vec<u8>>,
-        encrypted_name: Option<Vec<u8>>,
-        data_counter: u64,
-    ) -> Self {
-        IndexMetaBlockMetadata {
-            location,
-            created,
-            modified,
-            is_dummy,
-            encrypted_data,
-            encrypted_name,
-            data_counter,
-        }
     }
 }
 
@@ -321,24 +231,20 @@ mod tests {
 
     impl VaultIndex {
         /// Test helper: an empty index keyed by a random master key.
-        fn generate() -> Result<Self, IndexError> {
+        pub(crate) fn generate() -> Result<Self, IndexError> {
             let mut master = Zeroizing::new([0u8; 32]);
             secure_bytes_fill(master.as_mut_slice())?;
             VaultIndex::from_master_key(master.as_slice(), &[])
         }
 
         /// Test helper: insert under a plaintext name.
-        fn insert_named(
-            &mut self,
-            name: &str,
-            metadata: IndexMetaBlockMetadata,
-        ) -> Result<(), IndexError> {
+        fn insert_named(&mut self, name: &str, entry: IndexEntry) -> Result<(), IndexError> {
             let key = self.hmac_key_for_name(name)?;
-            self.insert_by_key(key, metadata)
+            self.insert_by_key(key, entry)
         }
 
         /// Test helper: look up by plaintext name.
-        fn lookup_named(&self, name: &str) -> Option<&IndexMetaBlockMetadata> {
+        fn lookup_named(&self, name: &str) -> Option<&IndexEntry> {
             self.lookup_by_key(&self.hmac_key_for_name(name).unwrap())
         }
     }
@@ -347,7 +253,7 @@ mod tests {
         master: &[u8],
         salt: &[u8],
         data_nonce_counter: u64,
-        files: HashMap<String, IndexMetaBlockMetadata>,
+        files: HashMap<String, IndexEntry>,
     ) -> Result<VaultIndex, IndexError> {
         let (enc_sub, hmac_sub) = derive_subkeys(master, salt).unwrap();
         VaultIndex::from_subkeys_and_data(
@@ -360,24 +266,20 @@ mod tests {
         )
     }
 
-    fn meta_with_counter(counter: u64) -> IndexMetaBlockMetadata {
-        IndexMetaBlockMetadata::new(
-            IndexMetaBlockLocation::Inline,
-            0,
-            0,
-            false,
-            None,
-            None,
-            counter,
-        )
+    pub(crate) fn entry_with_counter(counter: u64) -> IndexEntry {
+        IndexEntry {
+            data_counter: counter,
+            encrypted_name: vec![1u8; 40],
+            encrypted_data: vec![2u8; 40],
+        }
     }
 
     #[test]
-    fn generate_creates_index_with_counter_zero() {
+    fn from_master_key_starts_with_counters_at_zero() {
         let idx = VaultIndex::generate().unwrap();
         assert_eq!(idx.nonce_counter, 0);
         assert_eq!(idx.data_nonce_counter, 0);
-        assert_eq!(idx.version, VAULT_INDEX_VERSION);
+        assert!(idx.files.is_empty());
     }
 
     #[test]
@@ -404,17 +306,9 @@ mod tests {
     #[test]
     fn insert_and_lookup_roundtrip() {
         let mut idx = VaultIndex::generate().unwrap();
-        let meta = IndexMetaBlockMetadata::new(
-            IndexMetaBlockLocation::Inline,
-            1000,
-            2000,
-            false,
-            Some(b"encrypted".to_vec()),
-            None,
-            0,
-        );
-        idx.insert_named("secret.txt", meta.clone()).unwrap();
-        assert_eq!(idx.lookup_named("secret.txt"), Some(&meta));
+        let entry = entry_with_counter(0);
+        idx.insert_named("secret.txt", entry.clone()).unwrap();
+        assert_eq!(idx.lookup_named("secret.txt"), Some(&entry));
     }
 
     #[test]
@@ -424,12 +318,14 @@ mod tests {
     }
 
     #[test]
-    fn hashmap_keys_are_not_plaintext() {
+    fn map_keys_are_hex_hmacs_not_plaintext() {
         let mut idx = VaultIndex::generate().unwrap();
-        idx.insert_named("secret.txt", meta_with_counter(0))
+        idx.insert_named("secret.txt", entry_with_counter(0))
             .unwrap();
         for key in idx.files.keys() {
             assert_ne!(key, "secret.txt");
+            assert_eq!(key.len(), 64);
+            assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
         }
     }
 
@@ -452,26 +348,12 @@ mod tests {
     #[test]
     fn remove_by_key_works() {
         let mut idx = VaultIndex::generate().unwrap();
-        let meta = meta_with_counter(0);
-        idx.insert_named("to_remove.txt", meta.clone()).unwrap();
+        let entry = entry_with_counter(0);
+        idx.insert_named("to_remove.txt", entry.clone()).unwrap();
         let key = idx.hmac_key_for_name("to_remove.txt").unwrap();
-        assert_eq!(idx.remove_by_key(&key), Some(meta));
+        assert_eq!(idx.remove_by_key(&key), Some(entry));
         assert_eq!(idx.lookup_named("to_remove.txt"), None);
         assert_eq!(idx.remove_by_key(&key), None);
-    }
-
-    #[test]
-    fn from_data_rejects_unsupported_version() {
-        let result = VaultIndex::from_data(
-            999,
-            [0u8; XCHACHA20_NONCE_LEN],
-            0,
-            0,
-            LockedSecret::new(&[1u8; 32]).unwrap(),
-            LockedSecret::new(&[2u8; 32]).unwrap(),
-            HashMap::new(),
-        );
-        assert!(matches!(result, Err(IndexError::UnsupportedVersion)));
     }
 
     #[test]
@@ -505,18 +387,18 @@ mod tests {
     fn insert_at_cap_allows_overwrite_but_rejects_new_entry() {
         let mut idx = VaultIndex::generate().unwrap();
         for i in 0..MAX_INDEX_ENTRIES {
-            idx.insert_named(&format!("entry-{}", i), meta_with_counter(0))
+            idx.insert_named(&format!("entry-{}", i), entry_with_counter(0))
                 .unwrap();
         }
         assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
 
         // Overwriting an existing name does not grow the map: must succeed.
-        idx.insert_named("entry-0", meta_with_counter(1)).unwrap();
+        idx.insert_named("entry-0", entry_with_counter(1)).unwrap();
         assert_eq!(idx.files.len(), MAX_INDEX_ENTRIES);
 
         // A new name would exceed the cap: must fail.
         assert!(matches!(
-            idx.insert_named("one-too-many", meta_with_counter(2)),
+            idx.insert_named("one-too-many", entry_with_counter(2)),
             Err(IndexError::Full(MAX_INDEX_ENTRIES))
         ));
     }
@@ -542,20 +424,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_zeroize_clears_ciphertext_fields() {
-        let mut meta = IndexMetaBlockMetadata::new(
-            IndexMetaBlockLocation::Inline,
-            1,
-            2,
-            false,
-            Some(vec![9u8; 8]),
-            Some(vec![7u8; 8]),
-            3,
-        );
-        meta.zeroize();
-        assert_eq!(meta.encrypted_data, None);
-        assert_eq!(meta.encrypted_name, None);
-        assert_eq!(meta.data_counter, 0);
+    fn entry_zeroize_clears_ciphertext_fields() {
+        let mut entry = entry_with_counter(3);
+        entry.zeroize();
+        assert!(entry.encrypted_data.is_empty());
+        assert!(entry.encrypted_name.is_empty());
+        assert_eq!(entry.data_counter, 0);
     }
 
     #[test]
@@ -566,7 +440,7 @@ mod tests {
         let master = [0x11u8; 32];
         let salt = [0x22u8; 16];
         let mut files = HashMap::new();
-        files.insert("a".to_string(), meta_with_counter(5));
+        files.insert("a".to_string(), entry_with_counter(5));
 
         // Equal to the max stored counter: must be rejected.
         assert!(matches!(
@@ -586,7 +460,7 @@ mod tests {
         let master = [0x11u8; 32];
         let salt = [0x22u8; 16];
         let mut files = HashMap::new();
-        files.insert("a".to_string(), meta_with_counter(5));
+        files.insert("a".to_string(), entry_with_counter(5));
 
         assert!(index_from_master(&master, &salt, 6, files).is_ok());
     }
