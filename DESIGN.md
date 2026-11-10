@@ -199,6 +199,16 @@ by `derive_master_key` and wiped on drop: its last block is one hash away
 from the master key, and the `argon2` crate's own allocating entry point
 frees the matrix without clearing it.
 
+The matrix is also the largest allocation the crate makes, and its size
+comes from the header: 128 MiB by default, up to 256 MiB for a file at the
+accepted maximum (section 10.1). It is reserved with `try_reserve_exact`
+before it is filled, so an allocator that refuses the request (an
+address-space or container limit, a commit limit, a 32-bit target) yields
+`CryptoError` instead of aborting the process. Two cases are out of reach:
+a system that overcommits and kills the process when the pages are first
+written, and the Argon2i derivation of format version 1, whose matrix is
+allocated inside `orion`.
+
 No function of this crate returns key bytes by value. A returned array is
 moved through the caller's frame, and a move is a copy that may leave the
 bytes in a stack slot nothing wipes. The master key and the subkeys are
@@ -359,6 +369,20 @@ derivation; it remains in the AAD so that ciphertexts cannot be replayed
 across counter generations of the same entry name. The AAD uses the hex
 form of the key, as format version 1 did; the raw 32-byte key in the
 index is only its storage encoding.
+
+`encrypted_name` is what makes a vault enumerable. The map key is a
+one-way HMAC of the name, so the name can only be recovered by decrypting
+this copy: `Vault::with_names` and `Vault::names` do that for every entry
+(one AEAD decryption each, no secret touched) and produce the names
+sorted, and the re-encryption pass of `change_password` does it to store
+each entry again under the new keys. A name that fails to authenticate, or
+is not UTF-8, fails the whole call. `Vault::len` and `Vault::contains`
+read only the map and decrypt nothing; `contains` costs one HMAC and a
+probe whether the name exists or not. In memory, as in the file, names
+exist in plaintext only for the duration of the call that needs them:
+`with_names` lends them to a callback and wipes them when it returns,
+unwinding included. The one exception is the `Vec<String>` that `names`
+hands to its caller, which the caller owns.
 
 Limits:
 

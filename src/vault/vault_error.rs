@@ -27,8 +27,9 @@ pub enum VaultError {
     /// the vault already holds the maximum number of entries.
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-    /// A cryptographic or random-number operation failed, or locked memory
-    /// for the subkeys could not be allocated.
+    /// A cryptographic or random-number operation failed, or memory could
+    /// not be allocated: the locked pages for the subkeys, or the Argon2id
+    /// working memory when the allocator refuses the request.
     #[error("Crypto error: {0}")]
     CryptoError(String),
     /// The vault bytes are malformed, violate a documented bound, or the

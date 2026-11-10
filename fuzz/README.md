@@ -5,6 +5,17 @@ Fuzzing for the untrusted-input parsers of `Vault::open`, driven by
 toolchain). The targets call the parsers through the crate's `fuzzing`
 feature, which is never enabled in a normal build.
 
+CI does not fuzz. It only checks that this crate still compiles, on the
+stable toolchain and against the committed lockfile:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml --locked
+```
+
+That command fails when a dependency of the main crate has changed and
+`fuzz/Cargo.lock` has not followed; run it once without `--locked` to
+bring the lockfile up to date, then commit it.
+
 | Target            | What it exercises                                                |
 | ----------------- | ---------------------------------------------------------------- |
 | `parse_envelope`  | size cap, length fields, header JSON, KDF bounds, canonical header, minimum index length (steps 1-8 of DESIGN 2.1) |

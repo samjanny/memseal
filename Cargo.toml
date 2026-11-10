@@ -41,3 +41,22 @@ tempfile = "3"
 [[bench]]
 name = "full_bench"
 harness = false
+
+# Almost every test derives a key, and an unoptimized Argon2 pass over
+# 128 MiB takes seconds. Optimizing the four crates that do that work (the
+# two KDF implementations, the BLAKE2b under Argon2id, and the wipe of the
+# memory matrix) keeps `cargo test` in the dev profile, with debug
+# assertions and overflow checks still on everywhere, at a fraction of the
+# time. Profiles only apply to the root package of a build, so this has no
+# effect on crates that depend on memseal.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.orion]
+opt-level = 3
+
+[profile.dev.package.zeroize]
+opt-level = 3

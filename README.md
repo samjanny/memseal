@@ -83,6 +83,15 @@ fn main() -> Result<(), VaultError> {
     vault.store("name", b"secret")?;
     let matches = vault.with_secret("name", |secret| secret == b"secret")?;
     assert_eq!(matches, Some(true));
+
+    // List: count, membership, and the names themselves (sorted)
+    assert_eq!(vault.len(), 1);
+    assert!(!vault.is_empty());
+    assert!(vault.contains("name")?);
+    let listed = vault.with_names(|names| names.len())?; // names wiped after the closure
+    assert_eq!(listed, 1);
+    assert_eq!(vault.names()?, ["name"]); // caller-owned copy
+
     let existed = vault.remove("name")?; // bool
     assert!(existed);
 
@@ -161,7 +170,7 @@ fn main() {
 | `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault (a file cut off before the end of the smallest possible index is `CorruptedData` instead). Also returned by `change_password()` when the current password does not match. |
 | `InvalidInput(String)` | An argument violated a documented limit: password shorter than 8 bytes, entry name over 255 bytes, entry data over 64 MiB, or a new name when the vault already holds 1024 entries. |
 | `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, minimum index length, index version, entry count, entry sizes), or the authenticated index is internally inconsistent. Anything found before authentication is reported without running Argon2. |
-| `CryptoError(String)` | A cryptographic or random-number operation failed, or locked memory for the subkeys could not be allocated. |
+| `CryptoError(String)` | A cryptographic or random-number operation failed, or memory could not be allocated: the locked pages for the subkeys, or the Argon2id working memory when the allocator refuses it. |
 | `SerializationError(String)` | Serializing the vault failed, or the export exceeds 256 MiB. |
 | `IoError(std::io::Error)` | A file operation in `load()` or `save()` failed. |
 
@@ -224,6 +233,19 @@ In particular, caller code should avoid:
 
 Internal temporary plaintext and key material are zeroized where possible, but
 plaintext returned by `retrieve()` belongs to the caller.
+
+Entry names follow the same split. The vault never keeps a name in
+plaintext: it files each entry under an HMAC of its name and stores the
+name itself encrypted. `with_names()` decrypts those copies, lends the
+sorted names to a closure as `&[String]`, and zeroizes them when the
+closure returns, as `with_secret()` does for a secret; `names()` returns
+them as a `Vec<String>` that the caller owns and the vault cannot clear.
+Prefer `with_names()` when the names are sensitive in themselves.
+`len()`, `is_empty()`, and `contains()` decrypt nothing.
+
+`Vault` implements `Debug` so that it can be unwrapped out of a `Result` or
+held in a struct that derives `Debug`. The output is the number of entries
+and nothing else (`Vault { entries: 2, .. }`).
 
 If the caller wants drop-time zeroization, the returned `Vec<u8>` can be wrapped by the caller using `zeroize::Zeroizing`:
 
@@ -299,8 +321,8 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
 |--------|--------|
 | **Kernel-level or root attacker** | A privileged attacker can read process memory regardless of user-space protections. |
 | **Debugger-based extraction** | A debugger attached to the process can read decrypted data while it is being processed, including inside a `with_secret()` callback, or after it has been returned by `retrieve()`. |
-| **Caller-owned plaintext leaks** | `with_secret()` keeps the library-owned buffer scoped to a callback and zeroizes it afterward, but cannot prevent the callback from making copies. `retrieve()` returns `Vec<u8>` directly. The caller remains responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
-| **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. This includes the timing difference between a hit and a miss in `retrieve()`/`with_secret()`, which reveals whether a name exists to anyone who can time calls. |
+| **Caller-owned plaintext leaks** | `with_secret()` keeps the library-owned buffer scoped to a callback and zeroizes it afterward, but cannot prevent the callback from making copies. `retrieve()` returns `Vec<u8>` directly, and `names()` returns the entry names as `Vec<String>` (`with_names()` is its scoped counterpart). The caller remains responsible for avoiding logs, copies, long-lived plaintext, and unsafe conversions. |
+| **Side-channel attacks** | `memseal` does not attempt to mitigate Spectre, cache timing, power analysis, or other side channels. This includes the timing difference between a hit and a miss in `retrieve()`/`with_secret()`, which reveals whether a name exists to anyone who can time calls; `contains()` answers the same question outright. |
 | **Compromised dependencies** | The crate trusts its dependency chain, including `orion`, `argon2`, `memsec`, and `zeroize`. |
 | **Denial of service** | memseal detects corruption and refuses to open tampered files, but it cannot recover from them. An attacker with write or delete access to the vault file can deny access until a clean copy is restored. Backups and replication are the integrator's responsibility. |
 | **Full swap protection** | Only the two `LockedSecret` allocations that hold the subkeys are locked. Transient copies made during each operation, allocator metadata, returned plaintext, and caller-owned copies are outside that guarantee. |
@@ -382,6 +404,15 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
+Nearly every test derives a key with Argon2 over 128 MiB. `Cargo.toml`
+therefore optimizes four dependencies in the dev profile (`argon2`,
+`blake2`, `orion`, `zeroize`), which brings `cargo test` from over two
+minutes down to about half a minute while memseal itself still builds
+unoptimized, with debug assertions and overflow checks on. The first build
+compiles those four crates at `opt-level = 3`; nothing changes for crates
+that depend on memseal, since profiles apply only to the package being
+built.
+
 Run benchmarks with:
 
 ```bash
@@ -407,9 +438,14 @@ GitHub Actions runs on every push and PR to `main`:
 - `cargo check --all-targets`, with and without `--features fuzzing`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`, with and without `--features fuzzing`
-- `cargo test`
+- `cargo test` on Linux, macOS, and Windows
 - `cargo check --all-targets --locked` on the MSRV toolchain (1.88)
+- `cargo check --manifest-path fuzz/Cargo.toml --locked`, which compiles the
+  fuzz targets (nothing is fuzzed in CI) and fails if `fuzz/Cargo.lock` has
+  fallen behind the dependencies of the main crate
 - `rustsec/audit-check` action
+
+Everything except the test job runs on Linux only.
 
 ## MSRV
 

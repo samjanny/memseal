@@ -73,6 +73,18 @@ pub struct Vault {
     index: VaultIndex,
 }
 
+/// Prints the number of entries and nothing else, so a `Vault` can sit in a
+/// `Result` that is unwrapped, or in a struct that derives `Debug`, without
+/// its salt, nonces, entry keys, or ciphertexts reaching a log. The subkeys
+/// are out of reach of any formatter in the first place.
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("entries", &self.index.files.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Vault {
     /// Creates a new empty vault protected by the given password.
     ///
@@ -341,6 +353,142 @@ impl Vault {
         Ok(self.index.remove_by_key(&hmac_key).is_some())
     }
 
+    /// Returns the number of secrets in the vault.
+    pub fn len(&self) -> usize {
+        self.index.files.len()
+    }
+
+    /// Returns `true` if the vault holds no secrets.
+    pub fn is_empty(&self) -> bool {
+        self.index.files.is_empty()
+    }
+
+    /// Returns whether a secret with this name exists, without decrypting
+    /// anything.
+    ///
+    /// The cost is one HMAC of the name and a map probe, the same as a miss
+    /// in [`Vault::with_secret`], whether the name exists or not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    ///
+    /// assert!(vault.contains("api_key").unwrap());
+    /// assert!(!vault.contains("db_url").unwrap());
+    /// ```
+    pub fn contains(&self, name: &str) -> Result<bool, VaultError> {
+        let hmac_key = self.index.hmac_key_for_name(name)?;
+        Ok(self.index.lookup_by_key(&hmac_key).is_some())
+    }
+
+    /// Returns the names of all stored secrets, sorted in byte order.
+    ///
+    /// The vault is keyed by an HMAC of each name, so the names themselves
+    /// are recovered by decrypting the copy that [`Vault::store`] keeps next
+    /// to each secret: one AEAD decryption per entry, of the name only. No
+    /// secret is decrypted.
+    ///
+    /// The returned strings belong to the caller, like the buffer returned
+    /// by [`Vault::retrieve`]: the vault does not wipe them, and names are
+    /// otherwise never held in plaintext, in memory or in an exported vault.
+    /// Prefer [`Vault::with_names`] when the listing only needs to be used
+    /// temporarily. If any name fails to decrypt, the names decrypted up to
+    /// that point are wiped and the error is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("db_url", b"postgres://localhost/mydb").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    ///
+    /// assert_eq!(vault.names().unwrap(), ["api_key", "db_url"]);
+    /// assert_eq!(vault.len(), 2);
+    /// ```
+    pub fn names(&self) -> Result<Vec<String>, VaultError> {
+        // Moves the strings out of the wrapper; what is left behind to be
+        // wiped is an empty vector.
+        let mut names = self.decrypt_names()?;
+        Ok(std::mem::take(&mut *names))
+    }
+
+    /// Decrypts the names of all stored secrets and lends them to `f`,
+    /// sorted in byte order, for the duration of the call.
+    ///
+    /// This is to [`Vault::names`] what [`Vault::with_secret`] is to
+    /// [`Vault::retrieve`]: the library-owned strings are zeroized as soon
+    /// as `f` returns, including when `f` unwinds. The callback's return
+    /// value may leave the closure, but it cannot borrow the names. Callers
+    /// can still deliberately copy a name inside `f`; such copies are
+    /// caller-owned and are not zeroized by the vault.
+    ///
+    /// `f` is called exactly once on success, with an empty slice if the
+    /// vault holds no secrets. If any name fails to decrypt, `f` is not
+    /// called, the names decrypted up to that point are wiped, and the error
+    /// is returned. No secret is decrypted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("db_url", b"postgres://localhost/mydb").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    ///
+    /// let api_entries = vault
+    ///     .with_names(|names| names.iter().filter(|name| name.starts_with("api_")).count())
+    ///     .unwrap();
+    /// assert_eq!(api_entries, 1);
+    /// ```
+    ///
+    /// A reference to the temporary names cannot escape the callback:
+    ///
+    /// ```compile_fail
+    /// use memseal::Vault;
+    ///
+    /// let mut vault = Vault::create(b"my-password-here").unwrap();
+    /// vault.store("api_key", b"sk-secret-12345").unwrap();
+    /// let first: &str = vault
+    ///     .with_names(|names| names[0].as_str())
+    ///     .unwrap();
+    /// ```
+    pub fn with_names<R, F>(&self, f: F) -> Result<R, VaultError>
+    where
+        F: FnOnce(&[String]) -> R,
+    {
+        let names = self.decrypt_names()?;
+        Ok(f(names.as_slice()))
+    }
+
+    /// Decrypts every entry name into a vector that wipes its strings on
+    /// drop, sorted in byte order.
+    fn decrypt_names(&self) -> Result<Zeroizing<Vec<String>>, VaultError> {
+        // The names sit inside the zeroizing wrapper from the moment each
+        // one is decrypted, so a failure part-way through wipes the ones
+        // already recovered instead of dropping them as they are. The
+        // capacity is exact: pushing never reallocates, and sorting only
+        // swaps the string headers, so no name is ever copied.
+        let mut names = Zeroizing::new(Vec::with_capacity(self.index.files.len()));
+        with_enc_key(self.index.enc_key(), |enc_key| {
+            for (hmac_key, entry) in &self.index.files {
+                let mut name = decrypt_entry_name(enc_key, hmac_key, entry)?;
+                names.push(std::mem::take(&mut *name));
+            }
+            Ok(())
+        })?;
+        // Map order is arbitrary and changes between runs; a listing should
+        // not.
+        names.sort_unstable();
+        Ok(names)
+    }
+
     /// Serializes the vault to bytes for persistence, always in the current
     /// format (version 2).
     ///
@@ -511,17 +659,9 @@ impl Vault {
         // the whole pass; `store` borrows the new one the same way.
         with_enc_key(self.index.enc_key(), |old_enc_key| {
             for (old_hmac_key, entry) in &self.index.files {
+                let plaintext_name = decrypt_entry_name(old_enc_key, old_hmac_key, entry)?;
+
                 let old_aad = build_entry_aad(old_hmac_key, entry.data_counter);
-
-                let (name_nonce, name_ct) = split_nonce(&entry.encrypted_name)?;
-                let name_bytes = open_with_aad(old_enc_key, &name_nonce, name_ct, &old_aad)?;
-                let plaintext_name =
-                    Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
-                        let mut bytes = e.into_bytes();
-                        bytes.zeroize();
-                        VaultError::CorruptedData("Invalid entry name".to_string())
-                    })?);
-
                 let (data_nonce, data_ct) = split_nonce(&entry.encrypted_data)?;
                 let plaintext =
                     Zeroizing::new(open_with_aad(old_enc_key, &data_nonce, data_ct, &old_aad)?);
@@ -739,6 +879,29 @@ fn build_entry_aad(hmac_key: &str, counter: u64) -> Zeroizing<Vec<u8>> {
     aad
 }
 
+/// Decrypts the name stored with one entry. `hmac_key` is the map key the
+/// entry is filed under; together with the entry's data counter it is the
+/// AAD of both of the entry's ciphertexts (DESIGN.md section 8).
+///
+/// The name comes back in a zeroizing wrapper, and bytes that turn out not
+/// to be UTF-8 are wiped before the error is returned.
+fn decrypt_entry_name(
+    enc_key: &[u8; SUBKEY_LEN],
+    hmac_key: &str,
+    entry: &IndexEntry,
+) -> Result<Zeroizing<String>, VaultError> {
+    let entry_aad = build_entry_aad(hmac_key, entry.data_counter);
+    let (nonce, ciphertext) = split_nonce(&entry.encrypted_name)?;
+    let name_bytes = open_with_aad(enc_key, &nonce, ciphertext, &entry_aad)?;
+    String::from_utf8(name_bytes)
+        .map(Zeroizing::new)
+        .map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            VaultError::CorruptedData("Invalid entry name".to_string())
+        })
+}
+
 /// Lends the 32-byte encryption subkey to `f` straight from its locked
 /// container, for the duration of one operation.
 ///
@@ -805,7 +968,7 @@ fn derive_master_key(
         // free it without wiping; the last block of the lane is one hash away
         // from the master key, so the matrix is owned here and zeroized on
         // drop (the Argon2i path through `orion` wipes its own blocks).
-        let mut blocks = Zeroizing::new(vec![argon2::Block::default(); params.block_count()]);
+        let mut blocks = allocate_argon2_matrix(params.block_count())?;
         argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into_with_memory(
                 password,
@@ -816,6 +979,31 @@ fn derive_master_key(
             .map_err(|e| VaultError::CryptoError(format!("Argon2id derivation failed: {}", e)))?;
     }
     Ok(())
+}
+
+/// Allocates the Argon2id memory matrix: `block_count` zeroed 1 KiB blocks
+/// in a buffer that is wiped on drop.
+///
+/// The matrix is by far the largest allocation this crate makes (128 MiB
+/// with the default parameters, up to 256 MiB for a header at the accepted
+/// maximum), and its size comes from the header of the file being opened.
+/// `vec![..]` would abort the whole process if the allocator refused it;
+/// reserving fallibly first turns that into a `CryptoError` the caller can
+/// handle. This covers the allocator saying no (an address-space or
+/// container limit, a commit limit, a 32-bit target). It cannot cover a
+/// system that overcommits and kills the process later, when the pages are
+/// first written.
+fn allocate_argon2_matrix(block_count: usize) -> Result<Zeroizing<Vec<argon2::Block>>, VaultError> {
+    let mut blocks = Zeroizing::new(Vec::new());
+    blocks.try_reserve_exact(block_count).map_err(|e| {
+        VaultError::CryptoError(format!(
+            "Argon2id memory of {} KiB could not be allocated: {}",
+            block_count, e
+        ))
+    })?;
+    // Within the reserved capacity, so this fills without reallocating.
+    blocks.resize(block_count, argon2::Block::default());
+    Ok(blocks)
 }
 
 #[cfg(test)]
@@ -911,6 +1099,33 @@ mod tests {
         let header = VaultHeader::new([0x5A; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
         let key = master_key_for(b"known-answer-password", &header);
         assert_eq!(key_to_hex(key.as_slice()), ARGON2ID_KAT);
+    }
+
+    #[test]
+    fn allocate_argon2_matrix_returns_exactly_the_requested_zeroed_blocks() {
+        let blocks = allocate_argon2_matrix(8).unwrap();
+        assert_eq!(blocks.len(), 8);
+        assert!(blocks.capacity() >= 8);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.as_ref().iter().all(|&word| word == 0))
+        );
+
+        assert!(allocate_argon2_matrix(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn allocate_argon2_matrix_reports_an_unsatisfiable_size_as_an_error() {
+        // No allocator can satisfy this request, and `try_reserve_exact`
+        // refuses it without asking: the point is that the refusal comes
+        // back as an error instead of aborting the process, as `vec![]`
+        // would.
+        let Err(error) = allocate_argon2_matrix(usize::MAX / ::argon2::Block::SIZE) else {
+            panic!("an allocation of the whole address space cannot succeed");
+        };
+        assert!(matches!(error, VaultError::CryptoError(_)));
+        assert!(error.to_string().contains("could not be allocated"));
     }
 
     const ARGON2ID_KAT: &str = "99042566ff7a3da22162503ab2b2d089c071ec7b836c2eb1e395effde97bd229";
@@ -1331,6 +1546,15 @@ mod tests {
         let payload: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
         assert_eq!(vault.retrieve("blob").unwrap(), Some(payload));
         assert_eq!(vault.retrieve("gone").unwrap(), None);
+        assert_eq!(
+            vault.names().unwrap(),
+            [
+                "api_key".to_string(),
+                "blob".to_string(),
+                "empty".to_string(),
+                "n".repeat(255)
+            ]
+        );
     }
 
     #[test]
@@ -2175,5 +2399,291 @@ mod tests {
         ));
         // The failed change leaves the original vault usable.
         assert_eq!(vault.retrieve("real").unwrap(), Some(b"payload".to_vec()));
+    }
+
+    // Group H: listing (`len`, `is_empty`, `contains`, `names`) and `Debug`.
+
+    #[test]
+    fn len_and_is_empty_follow_store_overwrite_and_remove() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        assert_eq!(vault.len(), 0);
+        assert!(vault.is_empty());
+
+        vault.store("a", b"1").unwrap();
+        vault.store("b", b"2").unwrap();
+        assert_eq!(vault.len(), 2);
+        assert!(!vault.is_empty());
+
+        // An overwrite replaces the entry, it does not add one.
+        vault.store("a", b"3").unwrap();
+        assert_eq!(vault.len(), 2);
+
+        assert!(vault.remove("a").unwrap());
+        assert!(!vault.remove("a").unwrap());
+        assert_eq!(vault.len(), 1);
+        assert!(vault.remove("b").unwrap());
+        assert!(vault.is_empty());
+    }
+
+    #[test]
+    fn contains_follows_store_and_remove() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        assert!(!vault.contains("key").unwrap());
+
+        vault.store("key", b"value").unwrap();
+        assert!(vault.contains("key").unwrap());
+        // Names are exact byte strings: no trimming, no case folding.
+        assert!(!vault.contains("Key").unwrap());
+        assert!(!vault.contains("key ").unwrap());
+        assert!(!vault.contains("").unwrap());
+
+        vault.remove("key").unwrap();
+        assert!(!vault.contains("key").unwrap());
+    }
+
+    #[test]
+    fn contains_does_not_decrypt_the_entry() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("key", b"value").unwrap();
+        // Both ciphertexts are made undecryptable; a lookup that only
+        // consults the map still answers.
+        for entry in vault.index.files.values_mut() {
+            entry.encrypted_data = vec![0u8; 40];
+            entry.encrypted_name = vec![0u8; 40];
+        }
+        assert!(vault.contains("key").unwrap());
+        assert!(vault.retrieve("key").is_err());
+    }
+
+    #[test]
+    fn names_of_an_empty_vault_is_empty() {
+        let vault = Vault::create(b"password1234").unwrap();
+        assert_eq!(vault.names().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn names_returns_every_name_sorted_in_byte_order() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        // Inserted out of order, with an empty name, a non-ASCII name, and
+        // one at the length limit.
+        let longest = "z".repeat(MAX_ENTRY_NAME_LEN);
+        for name in ["delta", "", "alpha", "\u{e8}", "Beta", longest.as_str()] {
+            vault.store(name, name.as_bytes()).unwrap();
+        }
+
+        let names = vault.names().unwrap();
+        assert_eq!(
+            names,
+            ["", "Beta", "alpha", "delta", longest.as_str(), "\u{e8}"]
+        );
+        assert_eq!(names.len(), vault.len());
+        // Every listed name is one the vault answers to.
+        for name in &names {
+            assert!(vault.contains(name).unwrap());
+            assert_eq!(
+                vault.retrieve(name).unwrap(),
+                Some(name.as_bytes().to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn with_names_lends_the_sorted_names_and_returns_the_callback_value() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("delta", b"4").unwrap();
+        vault.store("alpha", b"1").unwrap();
+        vault.store("charlie", b"3").unwrap();
+
+        let (count, joined) = vault
+            .with_names(|names| (names.len(), names.join(",")))
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(joined, "alpha,charlie,delta");
+        // The same listing `names` returns.
+        let owned = vault.names().unwrap();
+        assert!(vault.with_names(|names| names == owned).unwrap());
+    }
+
+    #[test]
+    fn with_names_calls_back_once_with_an_empty_slice_for_an_empty_vault() {
+        let vault = Vault::create(b"password1234").unwrap();
+        let mut calls = 0;
+        let seen = vault
+            .with_names(|names| {
+                calls += 1;
+                names.len()
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn with_names_preserves_a_fallible_callback_result() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("a", b"1").unwrap();
+        let result: Result<usize, &str> = vault
+            .with_names(|names| {
+                if names.len() > 1 {
+                    Ok(names.len())
+                } else {
+                    Err("too few")
+                }
+            })
+            .unwrap();
+        assert_eq!(result, Err("too few"));
+    }
+
+    #[test]
+    fn with_names_does_not_call_back_when_a_name_fails_to_decrypt() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("good", b"1").unwrap();
+        vault.store("bad", b"2").unwrap();
+        let bad_key = vault.index.hmac_key_for_name("bad").unwrap();
+        let entry = vault.index.files.get_mut(bad_key.as_str()).unwrap();
+        *entry.encrypted_name.last_mut().unwrap() ^= 0x01;
+
+        let mut called = false;
+        let result = vault.with_names(|_| called = true);
+        assert!(matches!(result, Err(VaultError::CryptoError(_))));
+        assert!(!called);
+    }
+
+    #[test]
+    fn with_names_propagates_a_callback_panic_and_leaves_the_vault_usable() {
+        // The wipe on unwind is the wrapper's drop and cannot be observed
+        // from safe code; what can be checked is the path it runs on: a
+        // panic inside the callback propagates and the vault stays usable.
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("a", b"1").unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.with_names(|_| -> () { panic!("callback failure") })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(vault.names().unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn names_follow_overwrite_and_remove() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("a", b"1").unwrap();
+        vault.store("b", b"2").unwrap();
+        vault.store("a", b"3").unwrap();
+        assert_eq!(vault.names().unwrap(), ["a", "b"]);
+
+        vault.remove("a").unwrap();
+        assert_eq!(vault.names().unwrap(), ["b"]);
+    }
+
+    #[test]
+    fn names_survive_export_and_change_password() {
+        let mut vault = Vault::create(b"old-password").unwrap();
+        vault.store("second", b"2").unwrap();
+        vault.store("first", b"1").unwrap();
+
+        let reopened = Vault::open(b"old-password", &vault.export().unwrap()).unwrap();
+        assert_eq!(reopened.names().unwrap(), ["first", "second"]);
+
+        vault
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        assert_eq!(vault.names().unwrap(), ["first", "second"]);
+    }
+
+    #[test]
+    fn names_does_not_touch_the_vault_state() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("a", b"1").unwrap();
+        let nonce = vault.index.nonce;
+        let counters = (vault.index.nonce_counter, vault.index.data_nonce_counter);
+        let entry = vault.index.files.values().next().unwrap().clone();
+
+        vault.names().unwrap();
+        vault.contains("a").unwrap();
+
+        assert_eq!(vault.index.nonce, nonce);
+        assert_eq!(
+            (vault.index.nonce_counter, vault.index.data_nonce_counter),
+            counters
+        );
+        assert_eq!(vault.index.files.values().next().unwrap(), &entry);
+    }
+
+    #[test]
+    fn names_fails_when_a_name_ciphertext_does_not_authenticate() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("good", b"1").unwrap();
+        vault.store("bad", b"2").unwrap();
+        let bad_key = vault.index.hmac_key_for_name("bad").unwrap();
+        let entry = vault.index.files.get_mut(bad_key.as_str()).unwrap();
+        *entry.encrypted_name.last_mut().unwrap() ^= 0x01;
+
+        // One bad name fails the whole listing; nothing partial is returned.
+        assert!(matches!(vault.names(), Err(VaultError::CryptoError(_))));
+        // The secrets themselves are unaffected.
+        assert_eq!(vault.retrieve("bad").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn names_fails_when_a_name_blob_cannot_hold_a_nonce() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("real", b"payload").unwrap();
+        for entry in vault.index.files.values_mut() {
+            entry.encrypted_name = vec![0u8; 3];
+        }
+        assert!(matches!(vault.names(), Err(VaultError::CorruptedData(_))));
+    }
+
+    #[test]
+    fn decrypt_entry_name_rejects_a_name_that_is_not_utf8() {
+        // `store` only takes `&str`, so such a name can only come from a
+        // writer that holds the keys and does not follow the format.
+        let mut vault = Vault::create(b"password1234").unwrap();
+        vault.store("real", b"payload").unwrap();
+        let hmac_key = vault.index.hmac_key_for_name("real").unwrap();
+        let data_counter = vault.index.files[hmac_key.as_str()].data_counter;
+        let aad = build_entry_aad(&hmac_key, data_counter);
+        let forged_name = with_enc_key(vault.index.enc_key(), |key| {
+            Ok(seal_with_nonce_prefix(
+                key,
+                &[7u8; XCHACHA20_NONCE_LEN],
+                &[0xFF, 0xFE],
+                &aad,
+            )?)
+        })
+        .unwrap();
+        let entry = vault.index.files.get_mut(hmac_key.as_str()).unwrap();
+        entry.encrypted_name = forged_name;
+
+        let Err(error) = vault.names() else {
+            panic!("a name that is not UTF-8 must not be listed");
+        };
+        assert!(matches!(error, VaultError::CorruptedData(_)));
+        // The offending bytes are not echoed back in the error.
+        assert_eq!(error.to_string(), "Corrupted data: Invalid entry name");
+    }
+
+    #[test]
+    fn debug_output_shows_only_the_entry_count() {
+        let mut vault = Vault::create(b"password1234").unwrap();
+        assert_eq!(format!("{:?}", vault), "Vault { entries: 0, .. }");
+
+        vault.store("api_key", b"sk-secret-12345").unwrap();
+        vault.store("db_url", b"postgres://localhost").unwrap();
+        assert_eq!(format!("{:?}", vault), "Vault { entries: 2, .. }");
+        // The alternate form adds line breaks, not fields.
+        assert_eq!(
+            format!("{:#?}", vault),
+            "Vault {\n    entries: 2,\n    ..\n}"
+        );
+    }
+
+    #[test]
+    fn open_result_can_be_unwrapped_as_an_error() {
+        // `Result::unwrap_err` and `expect_err` need `Vault: Debug`.
+        let mut vault = Vault::create(b"password1234").unwrap();
+        let exported = vault.export().unwrap();
+        let error = Vault::open(b"wrong-password", &exported).unwrap_err();
+        assert!(matches!(error, VaultError::InvalidPassword));
     }
 }
