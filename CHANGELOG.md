@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-10
+
 ### Security
 
 * No function returns key bytes by value any more. `derive_master_key` writes the master key into a zeroizing buffer its caller owns, as `derive_subkeys` already did, and the encryption subkey is no longer copied out of its locked container for each operation: `extract_enc_key`, which returned a zeroizing array, is replaced by `with_enc_key`, which lends the 32 bytes to the operation by reference from the locked page. A value returned through a caller's frame is moved, and a move may leave the bytes in a stack slot that nothing wipes, most plainly in unoptimized builds; 0.3.0 had removed that pattern for the subkeys but kept it for these two. The only copy of the encryption subkey made during `store`, `retrieve`, `with_secret`, `export`, and `change_password` is now the one `orion` holds in its own zeroize-on-drop key type.
@@ -244,7 +246,8 @@ Initial release.
 * Bounded parsing for vault file size, header length, KDF parameters, entry name length, entry data size, and index entry count.
 * Public API: `Vault::create`, `Vault::open`, `Vault::load`, `Vault::save`, `Vault::store`, `Vault::retrieve`, `Vault::remove`, `Vault::change_password`, and `Vault::export`.
 
-[Unreleased]: https://github.com/samjanny/memseal/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/samjanny/memseal/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/samjanny/memseal/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/samjanny/memseal/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/samjanny/memseal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/samjanny/memseal/compare/v0.1.6...v0.2.0
