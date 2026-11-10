@@ -158,9 +158,9 @@ fn main() {
 
 | Variant | Meaning |
 |---------|---------|
-| `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault. Also returned by `change_password()` when the current password does not match. |
+| `InvalidPassword` | The encrypted index failed to authenticate: wrong password, or a tampered, truncated, or corrupted vault (a file cut off before the end of the smallest possible index is `CorruptedData` instead). Also returned by `change_password()` when the current password does not match. |
 | `InvalidInput(String)` | An argument violated a documented limit: password shorter than 8 bytes, entry name over 255 bytes, entry data over 64 MiB, or a new name when the vault already holds 1024 entries. |
-| `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, index version, entry count, entry sizes), or the authenticated index is internally inconsistent. |
+| `CorruptedData(String)` | The vault bytes violate the format or a documented bound (header length, KDF parameters, minimum index length, index version, entry count, entry sizes), or the authenticated index is internally inconsistent. Anything found before authentication is reported without running Argon2. |
 | `CryptoError(String)` | A cryptographic or random-number operation failed, or locked memory for the subkeys could not be allocated. |
 | `SerializationError(String)` | Serializing the vault failed, or the export exceeds 256 MiB. |
 | `IoError(std::io::Error)` | A file operation in `load()` or `save()` failed. |

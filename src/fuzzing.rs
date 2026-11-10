@@ -7,7 +7,7 @@
 //!
 //! This module is not part of the public API.
 
-/// Steps 1-5 of DESIGN.md section 2.1 on arbitrary bytes.
+/// Steps 1-8 of DESIGN.md section 2.1 on arbitrary bytes.
 pub fn parse_envelope(data: &[u8]) -> bool {
     crate::vault::facade::parse_envelope(data).is_ok()
 }

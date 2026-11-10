@@ -38,6 +38,16 @@ const ENTRY_FIXED_LEN: usize = ENTRY_KEY_LEN + 8 + 4 + 4;
 /// remaining bytes cannot possibly hold before anything is allocated.
 const MIN_ENTRY_LEN: usize = ENTRY_FIXED_LEN + 2 * MIN_ENCRYPTED_LEN;
 
+/// Shortest encrypted index a current-format file can carry: the preamble of
+/// an empty index plus the Poly1305 tag. `parse_envelope` rejects anything
+/// shorter before Argon2 runs, since it could not decode even if it
+/// authenticated.
+pub const MIN_ENCRYPTED_INDEX_LEN: usize = INDEX_PREAMBLE_LEN + POLY1305_OUTSIZE;
+/// The same floor for a format version 1 file, whose index is JSON. The
+/// bound is deliberately loose: two bytes is the shortest JSON document that
+/// is a container at all, far below anything release 0.2.1 wrote.
+pub const MIN_ENCRYPTED_INDEX_LEN_V1: usize = 2 + POLY1305_OUTSIZE;
+
 /// The decoded contents of an index, independent of the format version it
 /// was read from.
 pub struct IndexData {
@@ -99,6 +109,22 @@ fn check_entry_sizes(entry: &IndexEntry) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Exact length of `encode_index(index)`, computed without encoding
+/// anything. `Vault::export` uses it to enforce the file-size bound before
+/// it allocates or encrypts.
+///
+/// The sum cannot overflow: every term is the length of a buffer that is
+/// alive in this process, plus 48 bytes for each of at most
+/// `MAX_INDEX_ENTRIES` entries.
+pub fn encoded_index_len(index: &VaultIndex) -> usize {
+    INDEX_PREAMBLE_LEN
+        + index
+            .files
+            .values()
+            .map(|e| ENTRY_FIXED_LEN + e.encrypted_name.len() + e.encrypted_data.len())
+            .sum::<usize>()
+}
+
 /// Encodes the index in the current binary format.
 ///
 /// Layout (all integers little-endian):
@@ -118,13 +144,7 @@ pub fn encode_index(index: &VaultIndex) -> Result<Vec<u8>, VaultError> {
     let entry_count = u32::try_from(index.files.len())
         .map_err(|_| VaultError::SerializationError("too many entries".to_string()))?;
 
-    let total: usize = INDEX_PREAMBLE_LEN
-        + index
-            .files
-            .values()
-            .map(|e| ENTRY_FIXED_LEN + e.encrypted_name.len() + e.encrypted_data.len())
-            .sum::<usize>();
-
+    let total = encoded_index_len(index);
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&VAULT_INDEX_VERSION.to_le_bytes());
     out.extend_from_slice(&index.nonce_counter.to_le_bytes());
@@ -441,6 +461,31 @@ pub(crate) mod tests {
             bytes.len(),
             INDEX_PREAMBLE_LEN + ENTRY_FIXED_LEN + 40 + 10_000
         );
+        assert_eq!(encoded_index_len(&index), bytes.len());
+    }
+
+    #[test]
+    fn encoded_index_len_matches_the_encoding() {
+        let mut index = VaultIndex::generate().unwrap();
+        // An empty index is the preamble alone, which is what makes
+        // MIN_ENCRYPTED_INDEX_LEN the floor for any current-format file.
+        assert_eq!(encoded_index_len(&index), INDEX_PREAMBLE_LEN);
+        assert_eq!(encode_index(&index).unwrap().len(), INDEX_PREAMBLE_LEN);
+        assert_eq!(
+            MIN_ENCRYPTED_INDEX_LEN,
+            INDEX_PREAMBLE_LEN + POLY1305_OUTSIZE
+        );
+
+        for (i, (name_len, data_len)) in [(40, 40), (295, 41), (40, 70_000)].iter().enumerate() {
+            let k = index.hmac_key_for_name(&format!("n{i}")).unwrap();
+            index
+                .insert_by_key(k, entry(i as u64, *name_len, *data_len))
+                .unwrap();
+            assert_eq!(
+                encoded_index_len(&index),
+                encode_index(&index).unwrap().len()
+            );
+        }
     }
 
     #[test]

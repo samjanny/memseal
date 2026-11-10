@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+* `Vault::open` rejects a file whose encrypted index is too short to hold even an empty index before it derives a key. The floor is 38 bytes under a version 2 header (the 16-byte tag plus the 22-byte index preamble) and 18 under a version 1 header. Such a file used to cost a full Argon2 derivation with the parameters of its unauthenticated header, up to 256 MiB and 10 passes, only to fail the AEAD; a file cut right after the nonce took about 270 ms and 128 MiB with the default parameters and is now refused immediately. The error for these inputs changes from `InvalidPassword` to `CorruptedData`. No file memseal has written is affected: an empty vault exports exactly the minimum. A file truncated further in, with at least the minimum left, still fails authentication as `InvalidPassword`. See `DESIGN.md` section 2.1, step 8.
+* `Vault::store` and `Vault::export` encrypt straight into the buffer they keep or return instead of into a temporary that was then copied behind the nonce or the header. Storing a payload now allocates one buffer of its size instead of two, and an export holds one extra copy of the vault (the plaintext index, zeroized before returning) instead of two; for a 32 MiB entry the peak drops from 64 MiB to 32 MiB in `store` and from 96 MiB to 64 MiB in `export`. `change_password`, which stores every entry again, benefits in the same way.
+* `Vault::export` checks the 256 MiB bound on the size computed from the entry lengths, before the index is encoded or encrypted, where it used to build the whole oversized export and then discard it. A refused export allocates nothing and no longer advances the index nonce counter, so the vault is left exactly as it was.
+* `Vault::store` refuses a new name in a full vault before it consumes a data counter and encrypts the payload, instead of sealing up to 64 MiB first and failing at the insert.
+* The internal `seal_with_aad` is replaced by `seal_into`, which writes into a slice the caller owns and requires it to be exactly ciphertext plus tag, and `seal_with_nonce_prefix`, which produces an entry blob in one allocation. The public API is unchanged.
+
+### Fixed
+
+* A per-entry decryption failure was reported as "possible header tampering", a message written for the index and wrong for an entry, whose AAD is its HMAC key and data counter. The `CryptoError` text now says the ciphertext or its associated data did not authenticate.
+* `Vault::save` documented a directory `fsync` without saying that its failure is ignored. The doc comment now describes the step as best effort on Unix: the rename has already taken effect by then, so only its durability across a crash is in doubt.
+* `DESIGN.md` section 5.1 called the counters monotonic without qualification. They only grow within one generation of keys: `change_password` and the re-keying of a version 1 file start a new index with both counters at zero. The section now says so, and states that nothing reads `nonce_counter` back, so it is not a freshness signal.
+* Stale references to the parsing steps of `DESIGN.md` section 2.1: the comments on `parse_envelope` and on its fuzz entry point said steps 1-5, and the bounds table of section 10 placed the `header_len` check at step 2 instead of step 3. With the new index-length check the parser covers steps 1-8, and section 2.1, the table, `fuzz/README.md`, and the code comments agree.
+
 ## [0.3.0] - 2026-11-05
 
 ### Security

@@ -7,7 +7,7 @@ feature, which is never enabled in a normal build.
 
 | Target            | What it exercises                                                |
 | ----------------- | ---------------------------------------------------------------- |
-| `parse_envelope`  | size cap, length fields, header JSON, KDF bounds, canonical header (steps 1-7 of DESIGN 2.1) |
+| `parse_envelope`  | size cap, length fields, header JSON, KDF bounds, canonical header, minimum index length (steps 1-8 of DESIGN 2.1) |
 | `decode_index`    | the binary index decoder (format version 2)                      |
 | `decode_index_v1` | the legacy JSON index decoder (format version 1)                 |
 

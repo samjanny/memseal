@@ -29,14 +29,18 @@ use crate::constants::{
     MAX_KDF_ITERATIONS, MAX_KDF_MEMORY, MAX_VAULT_FILE_SIZE, MIN_KDF_ITERATIONS, MIN_KDF_MEMORY,
     MIN_PASSWORD_LEN, SUPPORTED_VAULT_VERSIONS,
 };
-use crate::crypto::aad_aead::{open_with_aad, seal_with_aad};
+use crate::crypto::aad_aead::{open_with_aad, seal_into, seal_with_nonce_prefix};
 use crate::crypto::utils::secure_bytes_fill;
 use crate::mem::locked_secret::LockedSecret;
-use crate::vault::index_codec::{decode_index, decode_index_v1, encode_index};
+use crate::vault::index_codec::{
+    MIN_ENCRYPTED_INDEX_LEN, MIN_ENCRYPTED_INDEX_LEN_V1, decode_index, decode_index_v1,
+    encode_index, encoded_index_len,
+};
 use crate::vault::vault_error::VaultError;
 use crate::vault::vault_header::VaultHeader;
 use crate::vault::vault_index::{IndexEntry, VaultIndex, derive_subkeys};
 use orion::hazardous::kdf::argon2i;
+use orion::hazardous::mac::poly1305::POLY1305_OUTSIZE;
 use std::io::Read as IoRead;
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
@@ -104,8 +108,10 @@ impl Vault {
     /// tampered, truncated, or corrupted file, so this variant covers both;
     /// callers that retry on it repeat the full key derivation each time.
     /// Structural problems found before or after authentication (bad length
-    /// fields, malformed header, out-of-range parameters, an inconsistent
-    /// index) return [`VaultError::CorruptedData`].
+    /// fields, malformed header, out-of-range parameters, an encrypted index
+    /// too short to hold even an empty one, an inconsistent index) return
+    /// [`VaultError::CorruptedData`]; those found before authentication are
+    /// reported without running Argon2.
     pub fn open(password: &[u8], data: &[u8]) -> Result<Self, VaultError> {
         let envelope = parse_envelope(data)?;
         let header = envelope.header;
@@ -209,6 +215,10 @@ impl Vault {
         // (which prevents entry-swap attacks).
         let hmac_key = self.index.hmac_key_for_name(name)?;
 
+        // A new name in a full vault is refused here, before a data counter
+        // is consumed and before the payload is encrypted for nothing.
+        self.index.ensure_room_for(&hmac_key)?;
+
         let data_counter = self.index.next_data_nonce_counter()?;
 
         // Random nonces from the OS CSPRNG. They are stored as the prefix of
@@ -223,18 +233,14 @@ impl Vault {
         let entry_aad = build_entry_aad(&hmac_key, data_counter);
         let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
-        let ciphertext = seal_with_aad(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)?;
-        let encrypted_name_ct =
-            seal_with_aad(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)?;
+        // Each blob is sealed directly behind its nonce in the allocation
+        // the index will keep, so storing a payload never holds a second
+        // copy of its ciphertext.
+        let encrypted_data =
+            seal_with_nonce_prefix(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)?;
+        let encrypted_name =
+            seal_with_nonce_prefix(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)?;
         drop(enc_key_bytes);
-
-        let mut encrypted_data = Vec::with_capacity(XCHACHA20_NONCE_LEN + ciphertext.len());
-        encrypted_data.extend_from_slice(&data_nonce);
-        encrypted_data.extend_from_slice(&ciphertext);
-
-        let mut encrypted_name = Vec::with_capacity(XCHACHA20_NONCE_LEN + encrypted_name_ct.len());
-        encrypted_name.extend_from_slice(&name_nonce);
-        encrypted_name.extend_from_slice(&encrypted_name_ct);
 
         let entry = IndexEntry {
             data_counter,
@@ -339,20 +345,33 @@ impl Vault {
     /// authenticated nonce counter.
     ///
     /// Returns [`VaultError::SerializationError`] if the serialized vault
-    /// exceeds the 256 MiB file-size bound enforced by [`Vault::load`]; this
-    /// guarantees that anything `export()` produces can be loaded back. The
-    /// index is a compact binary encoding, so the bound on total stored
+    /// would exceed the 256 MiB file-size bound enforced by [`Vault::load`];
+    /// this guarantees that anything `export()` produces can be loaded back.
+    /// The index is a compact binary encoding, so the bound on total stored
     /// secrets is close to the file bound itself: each entry costs its
     /// plaintext size plus 128 bytes plus the name length, on top of a
-    /// header of a few hundred bytes. The vault itself is left intact by
-    /// this error; remove entries and export again.
+    /// header of a few hundred bytes. The size is known before anything is
+    /// encoded, so this error costs no allocation and leaves the vault
+    /// exactly as it was, nonce counter included; remove entries and export
+    /// again.
+    ///
+    /// On top of the returned buffer, a successful export transiently holds
+    /// one more copy of the vault's size (the plaintext index, zeroized
+    /// before returning).
     pub fn export(&mut self) -> Result<Vec<u8>, VaultError> {
-        self.index.advance_nonce()?;
+        // The header bytes written to the file are also the AAD of the index
+        // (DESIGN.md section 3), so they are serialized once.
+        let header_bytes = self.header.to_aad_bytes()?;
+        let nonce_start = 4 + header_bytes.len();
+        let index_start = nonce_start + XCHACHA20_NONCE_LEN;
+        let total = index_start + encoded_index_len(&self.index) + POLY1305_OUTSIZE;
 
-        let header_json = Zeroizing::new(
-            serde_json::to_vec(&self.header)
-                .map_err(|e| VaultError::SerializationError(e.to_string()))?,
-        );
+        // Enforced on the computed size, before the index is encoded or
+        // encrypted and before the nonce counter moves: an oversized vault
+        // is refused for free instead of after materializing the export.
+        validate_export_size(total as u64)?;
+
+        self.index.advance_nonce()?;
 
         // The plaintext index carries HMAC'd names and counters; clear it on
         // scope exit like the rest of the key-handling in this file.
@@ -360,31 +379,36 @@ impl Vault {
 
         let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
-        let aad = self.header.to_aad_bytes()?;
-        let encrypted_index = seal_with_aad(&enc_key_bytes, &self.index.nonce, &index_bytes, &aad)?;
+        // One allocation of the final size; the index is sealed straight
+        // into its tail rather than into a buffer that is then copied.
+        let mut output = vec![0u8; total];
+        output[..4].copy_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+        output[4..nonce_start].copy_from_slice(&header_bytes);
+        output[nonce_start..index_start].copy_from_slice(&self.index.nonce);
+        seal_into(
+            &enc_key_bytes,
+            &self.index.nonce,
+            &index_bytes,
+            &header_bytes,
+            &mut output[index_start..],
+        )?;
         drop(enc_key_bytes);
-
-        let header_len = (header_json.len() as u32).to_le_bytes();
-
-        let mut output =
-            Vec::with_capacity(4 + header_json.len() + XCHACHA20_NONCE_LEN + encrypted_index.len());
-        output.extend_from_slice(&header_len);
-        output.extend_from_slice(&header_json);
-        output.extend_from_slice(&self.index.nonce);
-        output.extend_from_slice(&encrypted_index);
-
-        validate_export_size(output.len() as u64)?;
 
         Ok(output)
     }
 
     /// Saves the vault to a file on disk.
     ///
-    /// Writes a temporary file in the same directory, fsyncs it, renames it
-    /// over `path`, and fsyncs the directory. On Unix the file is created
-    /// with mode `0600`. On Windows no ACL is applied: the file inherits the
-    /// DACL of its directory, so callers who need owner-only access there
-    /// must restrict the directory or set the ACL themselves after saving.
+    /// Writes a temporary file in the same directory, fsyncs it, and renames
+    /// it over `path`. On Unix the directory is then fsynced as well, best
+    /// effort: by that point the rename has taken effect, so a failure of
+    /// this last step is not reported (some filesystems do not support it)
+    /// and only the durability of the rename across a crash is in doubt.
+    ///
+    /// On Unix the file is created with mode `0600`. On Windows no ACL is
+    /// applied: the file inherits the DACL of its directory, so callers who
+    /// need owner-only access there must restrict the directory or set the
+    /// ACL themselves after saving.
     ///
     /// Symbolic links in the directory components of `path` are followed; a
     /// link at `path` itself is replaced by the rename, not written through.
@@ -430,6 +454,8 @@ impl Vault {
             let _ = std::fs::remove_file(&tmp_path);
         })?;
 
+        // Best effort, see the doc comment: the new file is already in
+        // place, and reporting an error here would read as "not saved".
         #[cfg(unix)]
         if let Ok(dir_file) = std::fs::File::open(dir) {
             let _ = dir_file.sync_all();
@@ -540,7 +566,7 @@ pub(crate) struct Envelope<'a> {
     encrypted_index: &'a [u8],
 }
 
-/// Steps 1-5 of DESIGN.md section 2.1: the part of `open` that runs before
+/// Steps 1-8 of DESIGN.md section 2.1: the part of `open` that runs before
 /// any key derivation. It is pure and cheap, which is what makes it the
 /// right target for fuzzing the untrusted-input parser without paying for
 /// Argon2 on every input.
@@ -612,6 +638,22 @@ pub(crate) fn parse_envelope(data: &[u8]) -> Result<Envelope<'_>, VaultError> {
         }
     }
     let encrypted_index = &data[index_start..];
+
+    // An index shorter than a tag around the smallest possible plaintext
+    // cannot decode even if it authenticated, so it is rejected here rather
+    // than after an Argon2 derivation with the header's parameters.
+    let min_index_len = if header.version == LEGACY_VAULT_VERSION_1 {
+        MIN_ENCRYPTED_INDEX_LEN_V1
+    } else {
+        MIN_ENCRYPTED_INDEX_LEN
+    };
+    if encrypted_index.len() < min_index_len {
+        return Err(VaultError::CorruptedData(format!(
+            "Encrypted index of {} bytes is shorter than the minimum {}",
+            encrypted_index.len(),
+            min_index_len
+        )));
+    }
 
     Ok(Envelope {
         header,
@@ -1148,13 +1190,34 @@ mod tests {
         for i in 0..max {
             vault.store(&format!("k{}", i), b"v").unwrap();
         }
+        let counter_before = vault.index.data_nonce_counter;
         assert!(matches!(
             vault.store("one-more", b"v"),
             Err(VaultError::InvalidInput(_))
         ));
+        // The refusal comes before any work: no data counter is consumed.
+        assert_eq!(vault.index.data_nonce_counter, counter_before);
         // Overwriting an existing name is still allowed at the cap.
         vault.store("k0", b"v2").unwrap();
         assert_eq!(vault.retrieve("k0").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(vault.index.data_nonce_counter, counter_before + 1);
+    }
+
+    #[test]
+    fn store_keeps_one_exactly_sized_allocation_per_blob() {
+        // Each blob is nonce || ciphertext || tag, sealed in place: the
+        // allocation the index keeps has no slack and no second copy.
+        let mut vault = Vault::create(b"password-blobs").unwrap();
+        let payload = vec![0x5Au8; 1000];
+        vault.store("name", &payload).unwrap();
+
+        let entry = vault.index.files.values().next().unwrap();
+        let overhead = XCHACHA20_NONCE_LEN + POLY1305_OUTSIZE;
+        assert_eq!(entry.encrypted_data.len(), payload.len() + overhead);
+        assert_eq!(entry.encrypted_data.capacity(), payload.len() + overhead);
+        assert_eq!(entry.encrypted_name.len(), "name".len() + overhead);
+        assert_eq!(entry.encrypted_name.capacity(), "name".len() + overhead);
+        assert_eq!(vault.retrieve("name").unwrap(), Some(payload));
     }
 
     #[test]
@@ -1392,14 +1455,91 @@ mod tests {
     #[test]
     fn open_rejects_missing_ciphertext_after_nonce() {
         // Header and nonce present, but the ciphertext region is empty (no
-        // AEAD tag). The size check passes; AEAD must reject the input.
-        // `open_with_aad` failures are surfaced as `InvalidPassword` by design.
+        // AEAD tag). Nothing that short can hold an index, so it is a
+        // structural error reported before Argon2 runs, not an
+        // authentication failure.
         let valid = make_valid_export(b"password-cccc");
         let header_len = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
         let cut = 4 + header_len + XCHACHA20_NONCE_LEN;
         let truncated = &valid[..cut];
         let result = Vault::open(b"password-cccc", truncated);
-        assert!(matches!(result, Err(VaultError::InvalidPassword)));
+        match result {
+            Err(VaultError::CorruptedData(msg)) => {
+                assert!(msg.contains("Encrypted index"), "{}", msg)
+            }
+            _ => panic!("empty ciphertext region accepted or misreported"),
+        }
+    }
+
+    #[test]
+    fn parse_envelope_enforces_the_minimum_index_length() {
+        // The smallest genuine file is an empty vault: its encrypted index
+        // is exactly the 22-byte preamble plus the tag.
+        let mut vault = Vault::create(b"password-min").unwrap();
+        let empty = vault.export().unwrap();
+        let header_len = u32::from_le_bytes(empty[..4].try_into().unwrap()) as usize;
+        let index_start = 4 + header_len + XCHACHA20_NONCE_LEN;
+        assert_eq!(empty.len() - index_start, MIN_ENCRYPTED_INDEX_LEN);
+        assert_eq!(MIN_ENCRYPTED_INDEX_LEN, 38);
+        assert!(parse_envelope(&empty).is_ok());
+
+        // Every shorter index is rejected by the parser itself, which never
+        // derives a key.
+        for len in 0..MIN_ENCRYPTED_INDEX_LEN {
+            match parse_envelope(&empty[..index_start + len]) {
+                Err(VaultError::CorruptedData(msg)) => {
+                    assert!(msg.contains("Encrypted index"), "{}", msg)
+                }
+                _ => panic!("encrypted index of {} bytes accepted", len),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_envelope_enforces_the_legacy_minimum_index_length() {
+        // A version 1 envelope: header, nonce, the 8 skipped counter bytes,
+        // then the encrypted JSON index.
+        let mut header = VaultHeader::generate().unwrap();
+        header.version = LEGACY_VAULT_VERSION_1;
+        let header_json = header.to_aad_bytes().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        data.extend_from_slice(&header_json);
+        data.extend_from_slice(&[0u8; XCHACHA20_NONCE_LEN + 8]);
+        let index_start = data.len();
+        data.extend_from_slice(&[0u8; MIN_ENCRYPTED_INDEX_LEN_V1]);
+
+        let envelope = parse_envelope(&data).unwrap();
+        assert_eq!(envelope.encrypted_index.len(), MIN_ENCRYPTED_INDEX_LEN_V1);
+        for len in 0..MIN_ENCRYPTED_INDEX_LEN_V1 {
+            assert!(
+                matches!(
+                    parse_envelope(&data[..index_start + len]),
+                    Err(VaultError::CorruptedData(_))
+                ),
+                "legacy encrypted index of {} bytes accepted",
+                len
+            );
+        }
+
+        // The fixture written by 0.2.1 is far above the floor.
+        let fixture = parse_envelope(V1_FIXTURE).unwrap();
+        assert!(fixture.encrypted_index.len() > MIN_ENCRYPTED_INDEX_LEN_V1);
+    }
+
+    #[test]
+    fn open_reports_authentication_failure_at_the_minimum_index_length() {
+        // The floor is exact: an index of the minimum length reaches the
+        // AEAD, so a forged one fails authentication rather than parsing.
+        let password: &[u8] = b"password-floor";
+        let mut vault = Vault::create(password).unwrap();
+        let mut forged = vault.export().unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert!(matches!(
+            Vault::open(password, &forged),
+            Err(VaultError::InvalidPassword)
+        ));
     }
 
     // Tampering group B: header JSON tampering and AAD divergence.
@@ -1772,7 +1912,8 @@ mod tests {
         );
 
         let aad = header.to_aad_bytes().unwrap();
-        let encrypted_index = seal_with_aad(&enc_sub, &nonce, &index_bytes, &aad).unwrap();
+        let mut encrypted_index = vec![0u8; index_bytes.len() + POLY1305_OUTSIZE];
+        seal_into(&enc_sub, &nonce, &index_bytes, &aad, &mut encrypted_index).unwrap();
 
         let header_json = serde_json::to_vec(&header).unwrap();
         let mut output = Vec::new();
@@ -1881,10 +2022,13 @@ mod tests {
         ));
     }
 
-    /// Slowest test in the suite (tens of seconds in debug, about 1 GiB of
-    /// peak memory): it materializes an export just above the 256 MiB cap to
-    /// pin the guarantee end to end. The binary index adds only a few bytes
-    /// per entry, so four entries of the maximum size are needed.
+    /// Slowest test in the suite (tens of seconds in debug, several hundred
+    /// MiB of memory): it fills a vault just above the 256 MiB cap to pin
+    /// the guarantee end to end. The binary index adds only a few bytes per
+    /// entry, so four entries of the maximum size are needed. The oversized
+    /// export itself is refused from the computed size, before anything is
+    /// encoded; the memory goes to the entries and to the export that
+    /// succeeds afterwards.
     #[test]
     fn export_rejects_vault_exceeding_max_file_size() {
         fn pseudo_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -1899,16 +2043,23 @@ mod tests {
             vault.store(name, &payload).unwrap();
         }
 
+        let nonce_before = vault.index.nonce;
+        let nonce_counter_before = vault.index.nonce_counter;
         assert!(matches!(
             vault.export(),
             Err(VaultError::SerializationError(_))
         ));
+        // The refusal leaves the vault exactly as it was: the index nonce
+        // and its counter have not moved.
+        assert_eq!(vault.index.nonce, nonce_before);
+        assert_eq!(vault.index.nonce_counter, nonce_counter_before);
 
         // The vault stays intact and usable: dropping one entry brings the
         // export back under the cap.
         assert!(vault.remove("d").unwrap());
         let exported = vault.export().unwrap();
         assert!(exported.len() as u64 <= MAX_VAULT_FILE_SIZE);
+        assert_eq!(vault.index.nonce_counter, nonce_counter_before + 1);
         let reopened = Vault::open(b"password-size-cap", &exported).unwrap();
         assert_eq!(
             reopened.with_secret("a", |p| p.len()).unwrap(),

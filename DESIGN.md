@@ -73,29 +73,37 @@ In order, `Vault::open(password, data)` enforces:
    fields.
 6. `validate_header(&header)` succeeds (see section 3).
 7. `header_json` is byte-for-byte the canonical serialization of the
-   parsed header (`serde_json::to_vec`), which is also the AAD of step 8.
+   parsed header (`serde_json::to_vec`), which is also the AAD of step 9.
+   If `header.version` is 1, the 8 legacy counter bytes that follow the
+   nonce must also be present and are skipped (section 12).
+8. The bytes that remain are `encrypted_index`, and they must be able to
+   hold a Poly1305 tag around the smallest index plaintext: at least 38
+   bytes under a version 2 header (16 for the tag plus the 22-byte
+   preamble of an empty index, section 7), at least 18 under a version 1
+   header (the tag plus a two-byte JSON document, a deliberately loose
+   floor). Anything shorter could not decode even if it authenticated.
    This is the last check before Argon2 runs with the parameters taken
-   from the header. If `header.version` is 1, the 8 legacy counter bytes
-   that follow the nonce must also be present and are skipped (section
-   12).
-8. Argon2id (Argon2i under a version 1 header) and HKDF derive the
+   from the header.
+9. Argon2id (Argon2i under a version 1 header) and HKDF derive the
    subkeys, then XChaCha20-Poly1305 verification of `encrypted_index`
    succeeds with the serialized header JSON as AAD.
-9. The decrypted index decodes under the rules of section 7 (version tag,
-   entry count, every length against the remaining bytes and the
-   documented bounds, no duplicate keys, no trailing bytes). A version 1
-   header selects the legacy JSON decoder of section 12 instead.
-10. `data_nonce_counter` is strictly greater than every stored
+10. The decrypted index decodes under the rules of section 7 (version
+    tag, entry count, every length against the remaining bytes and the
+    documented bounds, no duplicate keys, no trailing bytes). A version 1
+    header selects the legacy JSON decoder of section 12 instead.
+11. `data_nonce_counter` is strictly greater than every stored
     `data_counter` (section 7).
 
-Steps 1-7 are implemented by `parse_envelope`, a pure function with no
-key derivation, and step 9 by `decode_index`; both are the intended fuzz
-targets. Failures at steps 1-7 return `VaultError::CorruptedData(...)`.
-Failure at step 8 returns `VaultError::InvalidPassword`: the AEAD does not
-distinguish "wrong key" from "tampered ciphertext or AAD" by design, so
-the variant means "authentication failed", not "the password was
-mistyped". Failures at steps 9 and 10 return
-`VaultError::CorruptedData(...)`.
+Steps 1-8 are implemented by `parse_envelope`, a pure function with no
+key derivation, and step 10 by `decode_index`; both are the intended fuzz
+targets. Failures at steps 1-8 return `VaultError::CorruptedData(...)`
+without running Argon2: a file cut off before or inside the minimum index
+is a structural error, not an authentication failure. Failure at step 9
+returns `VaultError::InvalidPassword`: the AEAD does not distinguish
+"wrong key" from "tampered ciphertext or AAD" by design, so the variant
+means "authentication failed", not "the password was mistyped". A file
+truncated further in, with at least the minimum index left, fails here
+too. Failures at steps 10 and 11 return `VaultError::CorruptedData(...)`.
 
 
 ## 3. Header (`VaultHeader`)
@@ -230,6 +238,19 @@ monotonic state:
 
 Counter overflow at `u64::MAX` is treated as a hard error, not a wrap.
 
+Both counters belong to one generation of keys, not to the vault for its
+whole life. `change_password()` and the re-keying of a version 1 file
+(section 12) build a fresh index under the new keys, and that index
+starts again with `nonce_counter = 0` and `data_nonce_counter = 0`; the
+entries are re-encrypted under new `data_counter` values as they are
+moved over. Within one generation neither counter ever decreases, and an
+`export()` that is refused for size does not advance `nonce_counter`.
+
+Nothing reads `nonce_counter` back: `open()` decodes it and the next
+export writes it incremented, but no check depends on its value. It is
+not a freshness or rollback signal (section 1), and a reader of the
+format must not treat a lower value as evidence of an older file.
+
 
 ## 6. AAD bindings
 
@@ -339,7 +360,10 @@ The aggregate bound is the file bound: total stored secrets plus 128
 bytes and the name length per entry (section 7) must stay under
 `MAX_VAULT_FILE_SIZE`, so a vault holds a little under 256 MiB of secrets
 in total, and `Vault::export` fails cleanly rather than producing a file
-that `Vault::load` would refuse.
+that `Vault::load` would refuse. The export size follows from the entry
+lengths alone, so the bound is checked before the index is encoded or
+encrypted: the refusal allocates nothing and leaves the index nonce and
+`nonce_counter` untouched.
 
 
 ## 9. Known oddities (current format)
@@ -364,11 +388,12 @@ All inputs that affect parsing memory or CPU are bounded before use:
 | ------------------------- | ---------------------------- | ---------------------------- |
 | file size (reading)       | `MAX_VAULT_FILE_SIZE = 256 MiB` | `Vault::load`             |
 | file size (writing)       | `MAX_VAULT_FILE_SIZE = 256 MiB` | `Vault::export`           |
-| `header_len`              | `<= MAX_HEADER_JSON_LEN (4 KiB)` | `Vault::open` step 2     |
+| `header_len`              | `<= MAX_HEADER_JSON_LEN (4 KiB)` | `Vault::open` step 3     |
 | `header.version`          | in `SUPPORTED_VAULT_VERSIONS`| `validate_header`            |
 | `header.kdf_memory_cost`  | `[32 MiB, 256 MiB]`          | `validate_header`            |
 | `header.kdf_iterations`   | `[3, 10]`                    | `validate_header`            |
 | `header.key_length`       | `== KEY_LEN (32)`            | `validate_header`            |
+| `encrypted_index` length  | `>= 38` (`>= 18` under a v1 header) | `Vault::open` step 8, before Argon2 |
 | index `version`           | `== VAULT_INDEX_VERSION` (or 1 under a v1 header) | `decode_index` |
 | entry name length         | `<= MAX_ENTRY_NAME_LEN (255)`| `Vault::store`               |
 | entry data size           | `<= MAX_ENTRY_DATA_SIZE (64 MiB)` | `Vault::store`          |
@@ -396,6 +421,10 @@ rejected:
   authenticated: section 12);
 * HKDF and one AEAD verification over at most 256 MiB of ciphertext,
   then one linear pass over the decrypted index.
+
+The derivation is only paid for a file that could still turn out to be a
+vault: a header that fails any check of section 2.1, or an encrypted
+index too short to hold even an empty one (step 8), is rejected first.
 
 The lower bounds serve the opposite goal: any file this library agrees to
 open costs an attacker at least 32 MiB and 3 passes per password guess,

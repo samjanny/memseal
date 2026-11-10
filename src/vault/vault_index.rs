@@ -91,7 +91,9 @@ impl VaultIndex {
     /// The nonce is drawn from the OS CSPRNG rather than derived from the
     /// counter, so two vault instances opened from the same persisted state
     /// cannot reuse a nonce when both export. The counter is kept as
-    /// authenticated, monotonic state.
+    /// authenticated state that only grows for as long as the index keeps
+    /// its keys; re-keying builds a new index and starts it again from zero
+    /// (DESIGN.md section 5.1).
     pub fn advance_nonce(&mut self) -> Result<(), IndexError> {
         self.nonce_counter = self
             .nonce_counter
@@ -128,6 +130,20 @@ impl VaultIndex {
                 .map_err(|_| IndexError::Crypto("HMAC failed".to_string()))
         })?;
         Ok(Zeroizing::new(key_to_hex(tag.unprotected_as_bytes())))
+    }
+
+    /// Checks that `insert_by_key` would accept `hashed_key`: either the key
+    /// is already present (an overwrite never grows the map) or the index is
+    /// below `MAX_INDEX_ENTRIES`.
+    ///
+    /// `Vault::store` calls this before it consumes a data counter and
+    /// encrypts the payload, so a new name at the cap is refused without
+    /// first sealing up to 64 MiB that would only be thrown away.
+    pub fn ensure_room_for(&self, hashed_key: &str) -> Result<(), IndexError> {
+        if self.files.len() >= MAX_INDEX_ENTRIES && !self.files.contains_key(hashed_key) {
+            return Err(IndexError::Full(MAX_INDEX_ENTRIES));
+        }
+        Ok(())
     }
 
     /// Inserts an entry under an already computed `hmac_key_for_name` key.
@@ -442,6 +458,29 @@ mod tests {
             idx.insert_named("one-too-many", entry_with_counter(2)),
             Err(IndexError::Full(MAX_INDEX_ENTRIES))
         ));
+    }
+
+    #[test]
+    fn ensure_room_for_agrees_with_insert_by_key() {
+        let mut idx = VaultIndex::generate().unwrap();
+        let existing = idx.hmac_key_for_name("entry-0").unwrap();
+        let fresh = idx.hmac_key_for_name("one-too-many").unwrap();
+
+        // Below the cap every key has room, present or not.
+        assert!(idx.ensure_room_for(&fresh).is_ok());
+        for i in 0..MAX_INDEX_ENTRIES {
+            idx.insert_named(&format!("entry-{}", i), entry_with_counter(0))
+                .unwrap();
+        }
+        assert!(idx.ensure_room_for(&existing).is_ok());
+        assert!(matches!(
+            idx.ensure_room_for(&fresh),
+            Err(IndexError::Full(MAX_INDEX_ENTRIES))
+        ));
+
+        // Removing one entry makes room for a new name again.
+        assert!(idx.remove_by_key(&existing).is_some());
+        assert!(idx.ensure_room_for(&fresh).is_ok());
     }
 
     #[test]
