@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+* No function returns key bytes by value any more. `derive_master_key` writes the master key into a zeroizing buffer its caller owns, as `derive_subkeys` already did, and the encryption subkey is no longer copied out of its locked container for each operation: `extract_enc_key`, which returned a zeroizing array, is replaced by `with_enc_key`, which lends the 32 bytes to the operation by reference from the locked page. A value returned through a caller's frame is moved, and a move may leave the bytes in a stack slot that nothing wipes, most plainly in unoptimized builds; 0.3.0 had removed that pattern for the subkeys but kept it for these two. The only copy of the encryption subkey made during `store`, `retrieve`, `with_secret`, `export`, and `change_password` is now the one `orion` holds in its own zeroize-on-drop key type.
+
 ### Changed
 
 * `Vault::open` rejects a file whose encrypted index is too short to hold even an empty index before it derives a key. The floor is 38 bytes under a version 2 header (the 16-byte tag plus the 22-byte index preamble) and 18 under a version 1 header. Such a file used to cost a full Argon2 derivation with the parameters of its unauthenticated header, up to 256 MiB and 10 passes, only to fail the AEAD; a file cut right after the nonce took about 270 ms and 128 MiB with the default parameters and is now refused immediately. The error for these inputs changes from `InvalidPassword` to `CorruptedData`. No file memseal has written is affected: an empty vault exports exactly the minimum. A file truncated further in, with at least the minimum left, still fails authentication as `InvalidPassword`. See `DESIGN.md` section 2.1, step 8.
@@ -21,6 +25,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 * `Vault::save` documented a directory `fsync` without saying that its failure is ignored. The doc comment now describes the step as best effort on Unix: the rename has already taken effect by then, so only its durability across a crash is in doubt.
 * `DESIGN.md` section 5.1 called the counters monotonic without qualification. They only grow within one generation of keys: `change_password` and the re-keying of a version 1 file start a new index with both counters at zero. The section now says so, and states that nothing reads `nonce_counter` back, so it is not a freshness signal.
 * Stale references to the parsing steps of `DESIGN.md` section 2.1: the comments on `parse_envelope` and on its fuzz entry point said steps 1-5, and the bounds table of section 10 placed the `header_len` check at step 2 instead of step 3. With the new index-length check the parser covers steps 1-8, and section 2.1, the table, `fuzz/README.md`, and the code comments agree.
+
+### Dependencies
+
+* `rand_core` is replaced by a direct dependency on `getrandom` 0.4, the crate `orion` already draws from, so the OS random source is reached through one version of it instead of two. `rand_core` was used only for `OsRng`, which is a wrapper around `getrandom` 0.3.
+* The `alloc` feature of `argon2` is dropped. memseal passes its own memory matrix to `hash_password_into_with_memory` and needs none of what the feature enables, while the feature pulled in `password-hash` and with it `rand_core` 0.6.
+* Together the two changes remove five packages from `Cargo.lock` (`getrandom` 0.3, `rand_core` 0.6 and 0.9, `password-hash`, `r-efi` 5) and upgrade none. `getrandom` 0.2 remains, required by `memsec`.
 
 ## [0.3.0] - 2026-11-05
 

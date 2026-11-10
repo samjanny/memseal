@@ -20,13 +20,13 @@ path = "src/lib.rs"
 
 [dependencies]
 zeroize = { version = "^1.8", features = ["derive"] }
-rand_core = { version = "0.9.3", features = ["os_rng"] }
+getrandom = "0.4.1"
 memsec = "0.7.0"
 orion = "0.17.16"
 thiserror = "2.0.12"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.5", default-features = false, features = ["zeroize"] }
 
 
 [features]

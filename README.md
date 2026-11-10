@@ -331,7 +331,7 @@ For the exact byte format, key derivation chain, nonce derivation, and AAD bindi
         +--> XChaCha20-Poly1305 encryption
 
 Per-entry encryption:
-  nonce = random 24 bytes (OsRng), stored as the ciphertext prefix
+  nonce = random 24 bytes (OS CSPRNG), stored as the ciphertext prefix
   aad   = hex(HMAC-SHA256(hmac_subkey, plaintext_name)) || data_counter (u64 LE)
   ct    = XChaCha20-Poly1305(enc_subkey, nonce, plaintext, aad)
 
@@ -350,7 +350,7 @@ Note: `mlock` is applied only to the two `LockedSecret` allocations that hold th
 | HKDF-SHA256 | `orion` | Subkey derivation |
 | XChaCha20-Poly1305 | `orion` | Authenticated encryption |
 | HMAC-SHA256 | `orion` | Entry-name hashing |
-| OsRng | `rand_core` | Random salt and nonce generation |
+| OS CSPRNG | `getrandom` | Random salt and nonce generation |
 | `mlock` / `munlock` | `memsec` | Page-exclusive locked allocations for the two subkeys |
 | Zeroization | `zeroize` | Clearing internal temporary secrets where possible |
 

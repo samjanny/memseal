@@ -1,4 +1,3 @@
-use rand_core::{OsRng, TryRngCore};
 use thiserror::Error;
 
 /// Error from the OS random number generator.
@@ -6,7 +5,8 @@ use thiserror::Error;
 #[error("{0}")]
 pub struct RandomError(&'static str);
 
-/// Fills a buffer with cryptographically secure random bytes.
+/// Fills a buffer with cryptographically secure random bytes from the
+/// operating system (`getrandom`, the same source `orion` draws from).
 ///
 /// # Errors
 /// - Returns an error if the buffer is empty.
@@ -16,9 +16,7 @@ pub fn secure_bytes_fill(buffer: &mut [u8]) -> Result<(), RandomError> {
         return Err(RandomError("Buffer is empty"));
     }
 
-    OsRng
-        .try_fill_bytes(buffer)
-        .map_err(|_| RandomError("Failed to fill buffer with random bytes"))?;
+    getrandom::fill(buffer).map_err(|_| RandomError("Failed to fill buffer with random bytes"))?;
     Ok(())
 }
 

@@ -80,7 +80,8 @@ impl Vault {
     pub fn create(password: &[u8]) -> Result<Self, VaultError> {
         validate_password(password)?;
         let header = VaultHeader::generate()?;
-        let master_key = derive_master_key(password, &header)?;
+        let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(password, &header, &mut master_key)?;
         let index = VaultIndex::from_master_key(master_key.as_slice(), &header.kdf_salt)?;
         Ok(Vault { header, index })
     }
@@ -122,7 +123,8 @@ impl Vault {
         // path, including the early returns below. (A version 1 file goes
         // through a second derivation in `rekey` below, after it has
         // authenticated.)
-        let master_key = derive_master_key(password, &header)?;
+        let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(password, &header, &mut master_key)?;
         let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         derive_subkeys(
@@ -231,16 +233,16 @@ impl Vault {
         secure_bytes_fill(&mut name_nonce)?;
 
         let entry_aad = build_entry_aad(&hmac_key, data_counter);
-        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
         // Each blob is sealed directly behind its nonce in the allocation
         // the index will keep, so storing a payload never holds a second
         // copy of its ciphertext.
-        let encrypted_data =
-            seal_with_nonce_prefix(&enc_key_bytes, &data_nonce, plaintext, &entry_aad)?;
-        let encrypted_name =
-            seal_with_nonce_prefix(&enc_key_bytes, &name_nonce, name.as_bytes(), &entry_aad)?;
-        drop(enc_key_bytes);
+        let (encrypted_data, encrypted_name) = with_enc_key(self.index.enc_key(), |key| {
+            Ok((
+                seal_with_nonce_prefix(key, &data_nonce, plaintext, &entry_aad)?,
+                seal_with_nonce_prefix(key, &name_nonce, name.as_bytes(), &entry_aad)?,
+            ))
+        })?;
 
         let entry = IndexEntry {
             data_counter,
@@ -324,9 +326,10 @@ impl Vault {
 
         let (nonce, ciphertext) = split_nonce(&entry.encrypted_data)?;
         let entry_aad = build_entry_aad(&hmac_key, entry.data_counter);
-        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
 
-        let plaintext = open_with_aad(&enc_key_bytes, &nonce, ciphertext, &entry_aad)?;
+        let plaintext = with_enc_key(self.index.enc_key(), |key| {
+            Ok(open_with_aad(key, &nonce, ciphertext, &entry_aad)?)
+        })?;
         Ok(Some(plaintext))
     }
 
@@ -377,22 +380,21 @@ impl Vault {
         // scope exit like the rest of the key-handling in this file.
         let index_bytes = Zeroizing::new(encode_index(&self.index)?);
 
-        let enc_key_bytes = extract_enc_key(self.index.enc_key())?;
-
         // One allocation of the final size; the index is sealed straight
         // into its tail rather than into a buffer that is then copied.
         let mut output = vec![0u8; total];
         output[..4].copy_from_slice(&(header_bytes.len() as u32).to_le_bytes());
         output[4..nonce_start].copy_from_slice(&header_bytes);
         output[nonce_start..index_start].copy_from_slice(&self.index.nonce);
-        seal_into(
-            &enc_key_bytes,
-            &self.index.nonce,
-            &index_bytes,
-            &header_bytes,
-            &mut output[index_start..],
-        )?;
-        drop(enc_key_bytes);
+        with_enc_key(self.index.enc_key(), |key| {
+            Ok(seal_into(
+                key,
+                &self.index.nonce,
+                &index_bytes,
+                &header_bytes,
+                &mut output[index_start..],
+            )?)
+        })?;
 
         Ok(output)
     }
@@ -493,7 +495,8 @@ impl Vault {
     /// any failure leaves it unchanged.
     fn rekey(&mut self, password: &[u8]) -> Result<(), VaultError> {
         let new_header = VaultHeader::generate()?;
-        let new_master_key = derive_master_key(password, &new_header)?;
+        let mut new_master_key = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(password, &new_header, &mut new_master_key)?;
         let new_index =
             VaultIndex::from_master_key(new_master_key.as_slice(), &new_header.kdf_salt)?;
         drop(new_master_key);
@@ -503,28 +506,30 @@ impl Vault {
             index: new_index,
         };
 
-        let old_enc_key = extract_enc_key(self.index.enc_key())?;
-
         // Re-encrypt entries one at a time into new_vault, reading the old
-        // ciphertexts in place.
-        for (old_hmac_key, entry) in &self.index.files {
-            let old_aad = build_entry_aad(old_hmac_key, entry.data_counter);
+        // ciphertexts in place. The old key is lent from its locked page for
+        // the whole pass; `store` borrows the new one the same way.
+        with_enc_key(self.index.enc_key(), |old_enc_key| {
+            for (old_hmac_key, entry) in &self.index.files {
+                let old_aad = build_entry_aad(old_hmac_key, entry.data_counter);
 
-            let (name_nonce, name_ct) = split_nonce(&entry.encrypted_name)?;
-            let name_bytes = open_with_aad(&old_enc_key, &name_nonce, name_ct, &old_aad)?;
-            let plaintext_name = Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
-                let mut bytes = e.into_bytes();
-                bytes.zeroize();
-                VaultError::CorruptedData("Invalid entry name".to_string())
-            })?);
+                let (name_nonce, name_ct) = split_nonce(&entry.encrypted_name)?;
+                let name_bytes = open_with_aad(old_enc_key, &name_nonce, name_ct, &old_aad)?;
+                let plaintext_name =
+                    Zeroizing::new(String::from_utf8(name_bytes).map_err(|e| {
+                        let mut bytes = e.into_bytes();
+                        bytes.zeroize();
+                        VaultError::CorruptedData("Invalid entry name".to_string())
+                    })?);
 
-            let (data_nonce, data_ct) = split_nonce(&entry.encrypted_data)?;
-            let plaintext =
-                Zeroizing::new(open_with_aad(&old_enc_key, &data_nonce, data_ct, &old_aad)?);
+                let (data_nonce, data_ct) = split_nonce(&entry.encrypted_data)?;
+                let plaintext =
+                    Zeroizing::new(open_with_aad(old_enc_key, &data_nonce, data_ct, &old_aad)?);
 
-            new_vault.store(&plaintext_name, &plaintext)?;
-        }
-        drop(old_enc_key);
+                new_vault.store(&plaintext_name, &plaintext)?;
+            }
+            Ok(())
+        })?;
 
         // Only swap on full success; on error, self retains old keys and data.
         self.header = new_vault.header;
@@ -537,7 +542,8 @@ impl Vault {
     /// constant-time comparison of the derived encryption subkey with the
     /// stored one.
     fn verify_password(&self, password: &[u8]) -> Result<(), VaultError> {
-        let master_key = derive_master_key(password, &self.header)?;
+        let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(password, &self.header, &mut master_key)?;
         let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         derive_subkeys(
@@ -733,38 +739,49 @@ fn build_entry_aad(hmac_key: &str, counter: u64) -> Zeroizing<Vec<u8>> {
     aad
 }
 
-/// Copies the 32-byte encryption subkey out of its locked container into a
-/// zeroize-on-drop buffer that lives only for the calling operation.
+/// Lends the 32-byte encryption subkey to `f` straight from its locked
+/// container, for the duration of one operation.
+///
+/// The key is never copied into a buffer of this crate: `f` receives a
+/// reference into the locked page, and the only copy made while it runs is
+/// the one `orion` keeps in its own zeroize-on-drop key type. A function
+/// that returned the key by value would be moved through its caller's frame,
+/// and a move may leave the bytes behind in a stack slot nothing wipes.
 ///
 /// The subkey is always exactly 32 bytes (HKDF-SHA256 output). Any other
-/// length is a hard error rather than being silently padded, which would
-/// otherwise lead to encryption or decryption under a partly known key.
-fn extract_enc_key(enc_secret: &LockedSecret) -> Result<Zeroizing<[u8; 32]>, VaultError> {
-    // Copy straight into the zeroizing buffer rather than through a bare
-    // array, so no unwiped copy is left on the stack.
-    let mut key = Zeroizing::new([0u8; 32]);
+/// length is a hard error, and `f` is not called, rather than being silently
+/// padded, which would otherwise lead to encryption or decryption under a
+/// partly known key.
+fn with_enc_key<R>(
+    enc_secret: &LockedSecret,
+    f: impl FnOnce(&[u8; SUBKEY_LEN]) -> Result<R, VaultError>,
+) -> Result<R, VaultError> {
     enc_secret.with_bytes(|bytes| {
-        if bytes.len() != key.len() {
-            return Err(VaultError::CryptoError(format!(
-                "encryption subkey is {} bytes, expected 32",
-                bytes.len()
-            )));
-        }
-        key.copy_from_slice(bytes);
-        Ok(())
-    })?;
-    Ok(key)
+        let key: &[u8; SUBKEY_LEN] = bytes.try_into().map_err(|_| {
+            VaultError::CryptoError(format!(
+                "encryption subkey is {} bytes, expected {}",
+                bytes.len(),
+                SUBKEY_LEN
+            ))
+        })?;
+        f(key)
+    })
 }
 
-/// Derives the master key from the password with the KDF of the header's
-/// format version: Argon2id for the current format, Argon2i for format
-/// version 1 (DESIGN.md sections 4 and 12). Both use the header's salt,
-/// memory cost, and pass count with a single lane.
+/// Derives the master key from the password into `master_key`, with the KDF
+/// of the header's format version: Argon2id for the current format, Argon2i
+/// for format version 1 (DESIGN.md sections 4 and 12). Both use the header's
+/// salt, memory cost, and pass count with a single lane.
+///
+/// Like `derive_subkeys`, this writes into a buffer the caller owns instead
+/// of returning the key: the caller passes a `Zeroizing` array, so the key
+/// exists in exactly one place and is wiped on every exit path, including
+/// the error returns below (which may leave it partly written).
 fn derive_master_key(
     password: &[u8],
     header: &VaultHeader,
-) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+    master_key: &mut [u8; KEY_LEN],
+) -> Result<(), VaultError> {
     if header.version == LEGACY_VAULT_VERSION_1 {
         argon2i::derive_key(
             password,
@@ -798,7 +815,7 @@ fn derive_master_key(
             )
             .map_err(|e| VaultError::CryptoError(format!("Argon2id derivation failed: {}", e)))?;
     }
-    Ok(master_key)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,26 +826,68 @@ mod tests {
         ENTRY_KEY_LEN, MAX_ENCRYPTED_NAME_LEN, MIN_ENCRYPTED_LEN, key_to_hex,
     };
 
-    #[test]
-    fn extract_enc_key_returns_32_bytes_for_valid_subkey() {
-        let key = [7u8; 32];
-        let secret = LockedSecret::new(&key).unwrap();
-        let extracted = extract_enc_key(&secret).unwrap();
-        assert_eq!(*extracted, key);
+    /// Test helper: the master key for `header` in a zeroizing buffer.
+    fn master_key_for(password: &[u8], header: &VaultHeader) -> Zeroizing<[u8; KEY_LEN]> {
+        let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(password, header, &mut master_key).unwrap();
+        master_key
     }
 
     #[test]
-    fn extract_enc_key_rejects_wrong_length_subkey() {
+    fn with_enc_key_lends_the_subkey_in_place() {
+        let key = [7u8; 32];
+        let secret = LockedSecret::new(&key).unwrap();
+        // The closure sees the bytes inside the locked region, not a copy:
+        // the address it is given is the one `with_bytes` hands out.
+        let locked_addr = secret.with_bytes(|bytes| bytes.as_ptr() as usize);
+        let lent_addr = with_enc_key(&secret, |lent| {
+            assert_eq!(lent, &key);
+            Ok(lent.as_ptr() as usize)
+        })
+        .unwrap();
+        assert_eq!(lent_addr, locked_addr);
+    }
+
+    #[test]
+    fn with_enc_key_propagates_the_closure_result() {
+        let secret = LockedSecret::new(&[7u8; 32]).unwrap();
+        assert_eq!(with_enc_key(&secret, |key| Ok(key.len())).unwrap(), 32);
+        assert!(matches!(
+            with_enc_key(&secret, |_| -> Result<(), VaultError> {
+                Err(VaultError::InvalidInput("from the closure".to_string()))
+            }),
+            Err(VaultError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn with_enc_key_rejects_wrong_length_subkey() {
         // A subkey that is not exactly 32 bytes must be a hard error rather
-        // than a silent fall-through that would leave part of the key buffer
-        // all-zero and lead to encryption under a partly known key.
+        // than a silent fall-through that would lead to encryption under a
+        // truncated or padded key. The closure must not run at all.
         for len in [16usize, 31, 33, 64] {
             let secret = LockedSecret::new(&vec![1u8; len]).unwrap();
-            assert!(matches!(
-                extract_enc_key(&secret),
-                Err(VaultError::CryptoError(_))
-            ));
+            let mut called = false;
+            let result = with_enc_key(&secret, |_| {
+                called = true;
+                Ok(())
+            });
+            assert!(matches!(result, Err(VaultError::CryptoError(_))));
+            assert!(!called, "closure ran for a {}-byte subkey", len);
         }
+    }
+
+    #[test]
+    fn derive_master_key_writes_only_into_the_caller_buffer_and_is_deterministic() {
+        let header = VaultHeader::new([0x33; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
+        let mut first = Zeroizing::new([0u8; KEY_LEN]);
+        derive_master_key(b"same-password", &header, &mut first).unwrap();
+        assert_ne!(*first, [0u8; KEY_LEN]);
+
+        // A buffer that already holds other bytes is fully overwritten.
+        let mut second = Zeroizing::new([0xFFu8; KEY_LEN]);
+        derive_master_key(b"same-password", &header, &mut second).unwrap();
+        assert_eq!(*first, *second);
     }
 
     #[test]
@@ -839,8 +898,8 @@ mod tests {
         legacy.version = LEGACY_VAULT_VERSION_1;
         let current = VaultHeader::new([7u8; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
         assert_eq!(current.version, VAULT_VERSION);
-        let k1 = derive_master_key(b"kdf-password", &legacy).unwrap();
-        let k2 = derive_master_key(b"kdf-password", &current).unwrap();
+        let k1 = master_key_for(b"kdf-password", &legacy);
+        let k2 = master_key_for(b"kdf-password", &current);
         assert_ne!(*k1, *k2);
     }
 
@@ -850,7 +909,7 @@ mod tests {
         // output) so a silent parameter change breaks the test rather than
         // every existing vault.
         let header = VaultHeader::new([0x5A; 16], MIN_KDF_ITERATIONS, MIN_KDF_MEMORY, 32);
-        let key = derive_master_key(b"known-answer-password", &header).unwrap();
+        let key = master_key_for(b"known-answer-password", &header);
         assert_eq!(key_to_hex(key.as_slice()), ARGON2ID_KAT);
     }
 
@@ -1885,7 +1944,7 @@ mod tests {
         use crate::vault::index_codec::tests::raw_encode;
 
         let header = VaultHeader::generate().unwrap();
-        let master_key = derive_master_key(password, &header).unwrap();
+        let master_key = master_key_for(password, &header);
         let mut enc_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         let mut hmac_sub = Zeroizing::new([0u8; SUBKEY_LEN]);
         derive_subkeys(
